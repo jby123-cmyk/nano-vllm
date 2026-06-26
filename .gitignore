@@ -8,7 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
+/build/
 develop-eggs/
 dist/
 downloads/
@@ -193,3 +193,12 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# TileLang compile artifacts from demos/compare_tokenize_embed.py --dump-build
+demos/build/*
+!demos/build/.gitkeep
+
+# RVV Stage 1 artifacts from demos/run_rvv_lower.py (regenerable .tir/.ll/.s);
+# keep the STAGE1_REPORT.md deliverable tracked.
+demos/build_rvv/*
+!demos/build_rvv/STAGE1_REPORT.md
