@@ -46,14 +46,21 @@ from tilelang.engine.lower import host_codegen, lower_to_host_device_ir
 from nanovllm.backends.tilelang.golden_log import (
     compare_and_log,
     log_numeric_exception,
-    write_skipped_golden_log,
 )
 
 # --------------------------------------------------------------------------- #
 # RVV target (mirror AraXL tvm-apps/kernels/common/common.py)
 # --------------------------------------------------------------------------- #
 DEFAULT_MTRIPLE = "riscv64-unknown-elf"
-DEFAULT_MATTR = ("+v", "+m", "+f", "+d")  # +v=RVV1.0, +m=mul/div, +f/+d=fp32/fp64
+# VLEN = 1024 bits × nr_lanes; default 4 lanes → +zvl4096b (AraXL).
+DEFAULT_NR_LANES = 4
+DEFAULT_MATTR = (
+    "+v",
+    "+m",
+    "+f",
+    "+d",
+    f"+zvl{1024 * DEFAULT_NR_LANES}b",
+)  # +v=RVV1.0, +m=mul/div, +f/+d=fp32/fp64
 DEFAULT_MABI = "lp64d"
 
 # RVV instruction families used to prove vectorization actually happened (T3).
@@ -71,16 +78,27 @@ def rvv_target(
     mtriple: str = DEFAULT_MTRIPLE,
     mattr=DEFAULT_MATTR,
     mabi: str = DEFAULT_MABI,
+    nr_lanes: int = DEFAULT_NR_LANES,
 ) -> tvm.target.Target:
-    """Build the AraXL RVV ``llvm`` target. ``mattr`` may be a list/tuple/str."""
+    """Build the AraXL RVV ``llvm`` target. ``mattr`` may be a list/tuple/str.
+
+    ``nr_lanes`` sets ``+zvl{1024*nr_lanes}b`` when no ``+zvl`` entry is present.
+    Pass an explicit ``mattr`` list to override VLEN entirely.
+    """
     if isinstance(mattr, str):
         mattr = [tok.strip() for tok in mattr.split(",") if tok.strip()]
+    else:
+        mattr = list(mattr)
+    vlen_bits = 1024 * nr_lanes
+    if not any(tok.startswith("+zvl") for tok in mattr):
+        mattr = [*mattr, f"+zvl{vlen_bits}b"]
     return tvm.target.Target(
         {
             "kind": "llvm",
             "mtriple": mtriple,
-            "mattr": list(mattr),
+            "mattr": mattr,
             "mabi": mabi,
+            "vector-width": vlen_bits,
         }
     )
 
@@ -274,9 +292,8 @@ def build_matmul_kernel(
     dtype: str = "float32",
     accum_dtype: str = "float32",
 ):
-    """(b) T.gemm matmul. Uses T.alloc_local (not fragments) so the CPU pipeline
-    can lower T.gemm via the scalar GemmScalar fallback, then lets LLVM
-    auto-vectorize the resulting triple loop (tilelang.md §6 limitation #1)."""
+    """(b) T.gemm matmul. Uses GemmVector on llvm (i,k + parallel N) and wide
+    RVV copy vectorization; GemmScalar on plain ``c`` targets."""
 
     @T.prim_func
     def main(

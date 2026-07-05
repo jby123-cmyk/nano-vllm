@@ -10,12 +10,16 @@ TileLang FlashAttention kernels for GPU; this one explains why the GPU memory
 model does **not** transfer directly to a long-vector machine, and how we adapt.
 
 > **Implementation status (read first).** This document is the *target* AraXL
-> mapping **strategy**, not the current code. The implemented Path B backend
-> (`tilelang.md`) lowers the GPU kernels to RVV via **generic LLVM
-> auto-vectorization** — it does **not yet** apply the AraXL-specific choices
-> described here (Option-A reductions §4.4, `exp2` polynomial §4.5, lane-major
-> GEMM layout §4.6, VRF-aware tiling §5). Those remain future work; see
-> `tilelang.md` §6 for what is and isn't done today.
+> mapping **strategy**. The Path B backend (`tilelang.md`) lowers the GPU kernels
+> to RVV via LLVM auto-vectorization. As of the wide-vectorization follow-up:
+>
+> - **Implemented today:** `GemmVector` (`i,k` + parallel `j`) for `T.gemm` on
+>   `llvm`; VLEN-aware `VectorizePlanner` for wide `T.copy` (64 fp32/step at
+>   `block_N=64`, VLEN=4096); unit-stride GEMM loads (`vfmacc` in asm; current
+>   decode build has `strided_ops: []`).
+> - **Still future work:** Option-A reductions (§4.4), `exp2` polynomial
+>   (§4.5), explicit lane-major layout for softmax (§4.4), VRF-aware tile sizing
+>   (§5), double-buffer prefetch budgeting, and Spike/Verilator execution.
 
 ---
 
@@ -136,6 +140,9 @@ C3 + C4 dictate the access pattern:
 
 - Load K/V blocks as **contiguous unit-stride** vectors so the VLSU issues long
   bursts over AXI; the crossbar/SRAM latency is amortized over the whole block.
+- The Path B `VectorizePlanner` now widens `T.copy` to VLEN/element-size (not
+  a fixed 128-bit / 4-fp32 cap); with `block_N=64` and VLEN=4096, copies move
+  64 fp32 per slice in lowered TIR.
 - Lean on the **decoupled VLSU**: prefetch the next K/V block while the current
   block is being consumed in the VRF (the vector analog of `T.Pipelined` /
   cp.async double-buffering). This requires budgeting VRF space for two K/V
@@ -174,6 +181,12 @@ Per **C7**, `Q@Kᵀ` and `P@V` become vectorized FMA loops over the contraction
 axis. The lane axis is chosen to keep operand access unit-stride and to feed the
 horizontal-reduction layout from §4.4 (the `S = Q@Kᵀ` output is consumed
 column-wise by the softmax, so the score tile is laid out columns-as-lanes).
+
+**Implemented (llvm target):** TileLang `GemmVector` lowers each `T.gemm` to
+`for i,k` serial + `for j in T.parallel(N)`, so `B[k,:]` and `C[i,:]` are
+unit-stride and LLVM emits `vfmacc` on the `j` loop. This matches the access
+pattern described here but does **not** yet pick softmax-specific lane layouts
+or VRF-sized tiles — see `tilelang.md` §6–7.
 
 ---
 

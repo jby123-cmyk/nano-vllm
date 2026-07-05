@@ -1,8 +1,8 @@
 # Stage 1 Report — TileLang → LLVM → RVV (Demo Backend)
 
-_Generated: 2026-06-25T21:42:09.325024+00:00_
+_Generated: 2026-07-03T22:21:19.778285+00:00_
 
-_Target: `{"kind":"llvm","tag":"","keys":["cpu"],"mabi":"lp64d","mtriple":"riscv64-unknown-elf","mattr":["+v","+m","+f","+d"]}`_
+_Target: `{"kind":"llvm","tag":"","keys":["cpu"],"vector-width":4096,"mabi":"lp64d","mtriple":"riscv64-unknown-elf","mattr":["+v","+m","+f","+d","+zvl4096b"]}`_
 
 
 This report records the **demo** described in `tilelang.md`: TileLang kernels routed through the CPU/`llvm` pass pipeline at the AraXL RVV target, with LLVM auto-vectorization on. **Path B** TileLang backend work (see `tilelang.md`) added CPU realizations for GPU-style tile ops so FlashAttention decode/prefill lower end-to-end; LLVM still owns vector scheduling (no custom LMUL tuning or AraXL subtarget). Remaining limitations are **observed in the artifacts**, not hidden.
@@ -19,9 +19,9 @@ python demos/run_rvv_lower.py
 | Kernel | Compiled | Vectorized | Numeric (host) | Failing pass | Notes |
 |--------|----------|------------|----------------|--------------|-------|
 | `elementwise` | yes | yes | pass | `—` | 5 RVV op kinds |
-| `matmul` | yes | yes | pass | `—` | 10 RVV op kinds; strided: vlse32 |
-| `attention_decode` | yes | yes | pass | `—` | 15 RVV op kinds; strided: vlse32 |
-| `attention_prefill` | yes | yes | pass | `—` | 15 RVV op kinds; strided: vlse32 |
+| `matmul` | yes | yes | pass | `—` | 8 RVV op kinds |
+| `attention_decode` | yes | yes | pass | `—` | 12 RVV op kinds; strided: vluxei64 |
+| `attention_prefill` | yes | yes | pass | `—` | 12 RVV op kinds; strided: vluxei64 |
 
 ## Emitted RVV instructions (evidence for T3)
 
@@ -52,75 +52,75 @@ python demos/run_rvv_lower.py
 ### `matmul`
 
 - Artifacts: `matmul.tir`, `matmul.ll`, `matmul.s`
-- Vector ops: `vfmul.vv, vfmv, vfmv.f, vfredosum, vle32.v, vmv, vse32.v, vse64.v, vsetivli, vsetvli`
-- Strided/indexed ops (AraXL unit-stride only): `vlse32`
+- Vector ops: `vfmacc.vv, vfmv.v, vle32.v, vmv, vse32.v, vse64.v, vsetivli, vsetvli`
+- Strided/indexed ops (AraXL unit-stride only): `none`
 
 ```asm
-	andi	t2, t1, 64
-	xori	t1, t2, 64
-	vsetvli	t3, zero, e32, m1, ta, ma
-	vfmv.s.f	v8, fa5
-	mv	t3, a7
-	mv	t4, a2
-	mv	t5, t1
-.Ltmp114:
-.LBB0_66:
-	vl2re32.v	v10, (t4)
-	vsetvli	t6, zero, e32, m2, ta, ma
-	vlse32.v	v12, (t3), s4
-	vfmul.vv	v10, v10, v12
-	vfredosum.vs	v8, v10, v8
+.LBB0_57:
+	li	a2, 64
+	vsetvli	zero, a2, e32, mf2, ta, ma
+	vle32.v	v8, (a0)
+	vse32.v	v8, (a1)
+.Ltmp99:
+	addi	a1, a1, 256
+.Ltmp100:
+	addi	a0, a0, 512
+	ld	a2, 112(sp)
+	bne	a1, a2, .LBB0_57
+.Ltmp101:
+	slli	s8, s8, 2
+.Ltmp102:
 ```
 
 ### `attention_decode`
 
 - Artifacts: `attention_decode.tir`, `attention_decode.ll`, `attention_decode.s`
-- Vector ops: `vfmacc.vv, vfmsub.vf, vfmul.vf, vfmul.vv, vfmv, vfmv.f, vfmv.v, vfredosum, vle32.v, vmv, vse32.v, vse64.v, vse8.v, vsetivli, vsetvli`
-- Strided/indexed ops (AraXL unit-stride only): `vlse32`
+- Vector ops: `vadd, vfmacc.vv, vfmsub.vf, vfmul.vf, vfmv.f, vfmv.v, vle32.v, vmv, vse32.v, vse64.v, vsetivli, vsetvli`
+- Strided/indexed ops (AraXL unit-stride only): `vluxei64`
 
 ```asm
-	addi	a1, a0, 64
-	li	a2, 32
-	vsetvli	zero, a2, e8, m2, ta, ma
-	vlseg2e8.v	v8, (a0)
-	vlseg2e8.v	v10, (a1)
-	ld	a0, 1376(sp)
-	vse8.v	v8, (a0)
-	ld	a0, 40(sp)
-	vse8.v	v10, (a0)
-	li	a1, 64
-	j	.LBB0_121
-.Ltmp223:
-.LBB0_120:
-	li	a1, 0
+	sd	a0, 24(sp)
+	li	a0, 128
+	vsetvli	zero, a0, e32, m1, ta, ma
+	vmv.v.i	v8, 0
+	csrr	a0, vlenb
+	slli	a0, a0, 2
+	add	a0, sp, a0
+	addi	a0, a0, 320
+	vs1r.v	v8, (a0)
+	li	a0, 64
+	vsetvli	zero, a0, e32, mf2, ta, ma
+	vmv.v.i	v8, 0
+	csrr	a0, vlenb
+	add	a0, sp, a0
 ```
 
 ### `attention_prefill`
 
 - Artifacts: `attention_prefill.tir`, `attention_prefill.ll`, `attention_prefill.s`
-- Vector ops: `vadd, vfmacc.vv, vfmsub.vf, vfmul.vf, vfmul.vv, vfmv, vfmv.f, vfmv.v, vfredosum, vle32.v, vmv, vse32.v, vse64.v, vsetivli, vsetvli`
-- Strided/indexed ops (AraXL unit-stride only): `vlse32`
+- Vector ops: `vadd, vfmacc.vv, vfmsub.vf, vfmul.vf, vfmv.f, vfmv.v, vle32.v, vmv, vse32.v, vse64.v, vsetivli, vsetvli`
+- Strided/indexed ops (AraXL unit-stride only): `vluxei64`
 
 ```asm
-	sd	a0, 664(sp)
-	vmv.s.x	v16, zero
-	vsetvli	a0, zero, e32, m2, ta, ma
-	vid.v	v8
+	sd	a0, 272(sp)
+	li	a0, 128
+	vsetvli	zero, a0, e32, m1, ta, ma
+	vmv.v.i	v8, 0
 	csrr	a0, vlenb
-	slli	a0, a0, 1
+	li	a1, 12
+	mul	a0, a0, a1
 	add	a0, sp, a0
-	addi	a0, a0, 720
-	vs2r.v	v8, (a0)
-	addi	a0, t3, 160
-	sd	a0, 456(sp)
-	addi	a0, t3, 176
-	sd	a0, 448(sp)
-	addi	a0, t3, 192
+	addi	a0, a0, 512
+	vs1r.v	v8, (a0)
+	li	a0, 64
+	vsetvli	zero, a0, e32, mf2, ta, ma
+	vmv.v.i	v8, 0
+	csrr	a0, vlenb
 ```
 
 ## Section 6 limitations — observed in the emitted artifacts
 
-1. **Scalar-fallback GEMM.** `T.gemm` lowers via `GemmScalar` to a plain triple loop and relies entirely on LLVM auto-vectorization. Observed: `matmul` compiled and LLVM vectorized the loop (`vfmul.vv, vfmv, vfmv.f, vfredosum, vle32.v, vmv…`), but the structure is a scalar triple loop tuned for short SIMD, not a long-vector machine.
+1. **GemmVector for all transpose forms.** `T.gemm` lowers via `GemmVector` on `llvm`: a `serial i,k` + `parallel j` nest with the output-`N` axis vectorized (`vfmacc` on the accumulator), including the transposed `Q @ K^T` in FlashAttention (its `B[j,k]` load becomes a strided/gather vector load). Observed: `matmul` vectorized to `vfmacc.vv, vfmv.v, vle32.v, vmv, vse32.v, vse64.v…`; LLVM still owns final VL/LMUL selection, so this is not a hand-tuned long-vector micro-kernel.
 
 2. **LLVM will not maximize vector length / LMUL.** Default LMUL is conservative; dynamic LMUL selection is unfinished upstream. LLVM vectorizes the loop *as written* (note the `vsetvli` reconfiguring VL per loop rather than a fixed long-vector schedule) and does not restructure for long vectors.
 
@@ -128,7 +128,7 @@ python demos/run_rvv_lower.py
 
 4. **No AraXL cost/scheduling model.** The `.s` uses generic RVV scheduling/LMUL; AraXL is not a modeled LLVM subtarget.
 
-5. **Unit-stride only.** AraXL cannot do strided/gather loads. Observed: strided/indexed ops emitted in the artifacts: `vlse32` — these (e.g. `vlse32`) would not run on AraXL and flag layouts that need contiguity fixes in a later stage.
+5. **Unit-stride only.** AraXL cannot do strided/gather loads. Observed: strided/indexed ops emitted in the artifacts: `vluxei64` — these (e.g. `vlse32`) would not run on AraXL and flag layouts that need contiguity fixes in a later stage.
 
 6. **No hardware transcendental.** `exp2` (softmax) is not a vector instruction; the baseline would scalarize it or call libm. The polynomial-via-`call_extern` fix is future work.
 

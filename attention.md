@@ -371,7 +371,7 @@ context_len`) instead of a computed causal predicate.
 | `T.alloc_shared(shape, dtype)` | Shared-memory tile (block-wide); on CPU/`llvm` promoted to **stack `local`** |
 | `T.alloc_fragment(shape, dtype)` | Register/tensor-core fragment; on CPU/`llvm` → **`local`** with replicated fragment layout |
 | `T.copy(src, dst)` | Bulk copy (global↔shared, fragment↔shared) |
-| `T.gemm(A, B, C, transpose_B=, policy=)` | Tensor-core matmul `C += A @ Bᵀ`; on CPU → **`GemmScalar`** (LLVM vectorizes); `policy=` ignored |
+| `T.gemm(A, B, C, transpose_B=, policy=)` | Tensor-core matmul `C += A @ Bᵀ`; on CPU/`llvm` → **`GemmVector`** (`i,k` + `T.parallel(N)`, `vfmacc` on `j`) for all transpose forms (transposed operand → indexed/gather load); `GemmScalar` only for `target=c`; `policy=` ignored |
 | `T.Pipelined(n, num_stages=)` | Software-pipelined loop on GPU; **pipeline injection skipped** on `llvm` |
 | `T.Parallel(...)` | Thread-parallel elementwise loop |
 | `T.reduce_max / T.reduce_sum(x, out, dim=)` | Row reductions |
@@ -687,24 +687,42 @@ See `handoff.md` §7 for the full roadmap.
 
 The FlashAttention kernels were written for CUDA (shared memory, fragments, warp
 GEMM policies, software pipelining). **Path B** teaches TileLang's existing
-CPU/`llvm` pipeline to lower the *same* kernels to RISC-V Vector assembly via
-LLVM auto-vectorization — no rewrite of the online-softmax algorithm.
+CPU/`llvm` pipeline to lower the *same* kernels to RISC-V Vector assembly — no
+rewrite of the online-softmax algorithm. A **wide-vectorization follow-up**
+added explicit `GemmVector` loop nests and VLEN-aware `T.copy` widening; see
+`tilelang.md` §6 for the full TileLang → TVM → LLVM pipeline.
 
 ### 10.1 What changes on CPU (not the math)
 
-| GPU concept | CPU/`llvm` lowering (after Path B) |
-|-------------|-------------------------------------|
+| GPU concept | CPU/`llvm` lowering (Path B + wide vectorization) |
+|-------------|---------------------------------------------------|
 | `T.alloc_shared` (Q/K/V/O tiles) | Promoted to **stack `local`** buffers before tile-op lowering |
 | `T.alloc_fragment` (acc_s, acc_o, softmax state) | **`local`** buffers + **fragment layouts** for `LayoutInference` |
-| `T.gemm(..., policy=FullRow)` | `GemmScalar` / `cpu.vector` inst selection; warp policy ignored |
+| `T.gemm(..., policy=FullRow)` | **`GemmVector`** on `llvm`: `for i,k` + `for j in T.parallel(N)`; LLVM emits `vfmacc` on `j`. Both the non-transposed `P @ V` and the transposed `Q @ K^T` use this nest; `Q @ K^T`'s `B[j,k]` operand lowers to an indexed/gather load (`vluxei`). `GemmScalar` only on `target=c` |
+| `T.copy` (K/V/Q tile loads) | **`VectorizePlanner`** widens copy loops using target VLEN (e.g. 64 fp32/step at `block_N=64`, VLEN=4096) — not a fixed 4-wide cap |
 | `T.reduce_max` / `T.reduce_sum` | Serial CPU reduce lowering (`src/cpu/op/reduce.cc`) |
 | `T.fill(-T.infinity(...))` | CPU fill for `local.fragment` scopes |
 | `T.Pipelined(..., num_stages=2)` | Present in source TIR; **pipeline injection disabled** for `llvm` |
 | `T.exp2` (softmax) | LLVM/libm `exp2`; not a native RVV transcendental |
-| `threads=128` launch | Degenerate 1-wide logical thread; **RVV lanes** come from LLVM `VectorizeLoop` |
+| `threads=128` launch | Degenerate 1-wide logical thread; **RVV lanes** from LLVM `VectorizeLoop` + `GemmVector` parallel loops |
 
 Default demo dtype is **`float32`** (`+f,+d` on the RVV target). fp16 needs
 `zvfh` and remains GPU-oriented in this repo.
+
+### 10.1b Two vectorization stages (why `+zvl4096b` alone was not enough)
+
+RVV code quality depends on **two** passes, not just LLVM:
+
+1. **TileLang `VectorizePlanner`** (`loop_vectorize.cc`) — runs in the CPU pipeline
+   *before* LLVM. It vectorizes `T.copy` loops using `vector-width` /
+   `llvm_get_vector_width` (4096 bits for AraXL 4-lane). Without `with rvv:`
+   during lowering, this pass falls back to **128 bits** → 4 fp32 copy slices.
+2. **LLVM `VectorizeLoop`** — vectorizes elementwise loops and the
+   `T.parallel(N)` body from `GemmVector` into scalable
+   `<vscale x 4 x float>` and `llvm.fmuladd.nxv4f32`.
+
+`rvv_target(nr_lanes=4)` must set **both** `+zvl4096b` and `vector-width: 4096`.
+Use `demos/run_rvv_lower.py --nr-lanes N` to retarget other lane counts.
 
 ### 10.2 Prerequisites
 
@@ -730,6 +748,12 @@ in one shot and writes `demos/build_rvv/STAGE1_REPORT.md`:
 python demos/run_rvv_lower.py
 ```
 
+With explicit VLEN (default 4 lanes → `+zvl4096b`):
+
+```bash
+python demos/run_rvv_lower.py --nr-lanes 4
+```
+
 Qwen3-ish dimensions (fp32):
 
 ```bash
@@ -748,8 +772,14 @@ Artifacts per kernel under `demos/build_rvv/<name>/`:
 | `metadata.json` | Target, shapes, detected RVV op families |
 
 Observed RVV families in decode/prefill asm include `vsetvli`, `vle32`, `vse32`,
-`vfmacc`, `vfmul`, `vfredosum`, and (for some layouts) strided `vlse32` — see
-`STAGE1_REPORT.md` for the full scan.
+`vfmacc`, `vfmul`, `vfredosum`, and (in some builds) strided `vlse32` — see
+`STAGE1_REPORT.md` for the full scan. After wide vectorization, the default
+decode build reports **`strided_ops: []`** in `metadata.json` (unit-stride GEMM
++ wide copies); matmul shows `vfmacc.vv` in the hot loop.
+
+**Lowered attention GEMM shape (decode, `block_N=64`):** both `Q@Kᵀ` and
+`P@V` appear in `.tir` as `for i,k` + `for j in T.parallel(64)` after
+`GemmVector` lowering — the same nest documented in `tilelang.md` §6.
 
 ### 10.4 Lower a single kernel programmatically
 
@@ -759,7 +789,7 @@ from tilelang.engine.lower import lower_to_host_device_ir, host_codegen
 from nanovllm.backends.tilelang.attention import build_flash_attention_decode_kernel
 from nanovllm.backends.tilelang.rvv_lower import rvv_target, lower_kernel_rvv
 
-rvv = rvv_target()  # riscv64-unknown-elf, +v,+m,+f,+d, lp64d
+rvv = rvv_target(nr_lanes=4)  # riscv64-unknown-elf, +v,+m,+f,+d,+zvl4096b, vector-width=4096
 
 decode_tir = build_flash_attention_decode_kernel.get_tir(
     1, 128, 8, 2, 64, 0.125, 128, 64, 2, 128, "float32"
@@ -797,10 +827,22 @@ compiles the same `@T.prim_func` on the host via `llvm` + `tvm_ffi` (the
 stage (`AttentionStage` with `tilelang_backend='cpu'`). `run_rvv_lower.py` runs
 this automatically for decode/prefill alongside RVV asm emission.
 
-### 10.6 Known RVV limitations (still true after Path B)
+### 10.6 Known RVV limitations (still true after wide vectorization)
 
-Path B fixed **lowering** (fragments, shared tiles, reduce, infinity). It did
-**not** add AraXL-specific scheduling, LMUL tuning, hardware `exp2`, or fp16.
-Strided loads (`vlse32`) may appear in asm and are incompatible with AraXL's
-unit-stride-only vector memory. See `demos/build_rvv/STAGE1_REPORT.md` §6 and
-`tilelang.md` §5 for the full list and follow-ups.
+Path B fixed **lowering** (fragments, shared tiles, reduce, infinity). Wide
+vectorization fixed the worst **auto-vec gaps** (4-wide copies, scalar GEMM
+inner loops). Still open:
+
+- **Not hand-tuned** — LLVM LMUL/VL selection, not AraXL `apps/gemm`-style kernels.
+- **`block_N=64` vs VLEN** — tiles smaller than full 256-fp32 vector width per op.
+- **Softmax reductions still serial** — `reduce_max`/`reduce_sum` lower to
+  horizontal `vfslide1down` shuffles, not lane-parallel reductions. The GEMMs
+  vectorize; the reduction axis does not (AraXL Option-A is future work,
+  `memory.md` §4.4–4.5).
+- **No software `exp2` polynomial** — softmax `exp2` still uses libm/scalar paths.
+- **fp16** needs `zvfh`.
+- **Strided/gather ops** — the transposed `Q @ K^T` operand load lowers to
+  `vluxei64` (in `strided_ops`); expected with AraXL's unit-stride constraint out
+  of scope. Layouts may add more with different tile shapes — re-scan after changes.
+
+See `demos/build_rvv/STAGE1_REPORT.md` §6 and `tilelang.md` §7 for follow-ups.

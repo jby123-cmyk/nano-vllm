@@ -7,9 +7,9 @@ This is the reproducible Stage 1 command from ``tilelang.md``. It runs a
 kernel ladder from trivial to the real thing:
 
   (a) elementwise add          — unit-stride vector copy/add
-  (b) T.gemm matmul            — exercises the scalar GemmScalar fallback
-  (c) FlashAttention decode    — the real decode kernel (attempted; fp32)
-  (d) FlashAttention prefill   — the real prefill kernel (attempted; fp32)
+  (b) T.gemm matmul            — GemmVector parallel-N vfmacc nest
+  (c) FlashAttention decode    — the real decode kernel (fp32)
+  (d) FlashAttention prefill   — the real prefill kernel (fp32)
 
 Default run (AraXL RVV target, demos/build_rvv/, numeric checks on):
 
@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mtriple", default=DEFAULT_MTRIPLE, help="LLVM target triple.")
     p.add_argument("--mattr", default=",".join(DEFAULT_MATTR), help="Comma-separated LLVM attrs.")
     p.add_argument("--mabi", default=DEFAULT_MABI, help="RISC-V ABI.")
+    p.add_argument(
+        "--nr-lanes",
+        type=int,
+        default=4,
+        help="AraXL lane count; sets +zvl{1024*nr_lanes}b when mattr has no +zvl (default 4 → VLEN 4096).",
+    )
     # Elementwise / gemm shapes
     p.add_argument("--elem-n", type=int, default=4096, help="Elementwise vector length.")
     p.add_argument("--gemm-m", type=int, default=128)
@@ -170,12 +176,15 @@ def _limitations_section(results: list[LowerResult]) -> str:
 
     L = []
     L.append(
-        "1. **Scalar-fallback GEMM.** `T.gemm` lowers via `GemmScalar` to a plain "
-        "triple loop and relies entirely on LLVM auto-vectorization. "
+        "1. **GemmVector for all transpose forms.** `T.gemm` lowers via "
+        "`GemmVector` on `llvm`: a `serial i,k` + `parallel j` nest with the "
+        "output-`N` axis vectorized (`vfmacc` on the accumulator), including the "
+        "transposed `Q @ K^T` in FlashAttention (its `B[j,k]` load becomes a "
+        "strided/gather vector load). "
         + (
-            f"Observed: `matmul` compiled and LLVM vectorized the loop "
-            f"(`{', '.join(gemm.vector_ops[:6])}…`), but the structure is a scalar "
-            "triple loop tuned for short SIMD, not a long-vector machine."
+            f"Observed: `matmul` vectorized to `{', '.join(gemm.vector_ops[:6])}…`; "
+            "LLVM still owns final VL/LMUL selection, so this is not a hand-tuned "
+            "long-vector micro-kernel."
             if gemm and gemm.compiled
             else "See `matmul` artifacts."
         )
@@ -250,7 +259,7 @@ def _limitations_section(results: list[LowerResult]) -> str:
 
 def main() -> int:
     args = parse_args()
-    target = rvv_target(args.mtriple, args.mattr, args.mabi)
+    target = rvv_target(args.mtriple, args.mattr, args.mabi, nr_lanes=args.nr_lanes)
     target_str = str(target)
     scale = args.head_dim ** -0.5
 
@@ -274,7 +283,7 @@ def main() -> int:
     mm = build_matmul_kernel(args.gemm_m, args.gemm_n, args.gemm_k, dtype="float32")
     r = lower_kernel_rvv(
         mm, "matmul", os.path.join(args.out_dir, "matmul"), target,
-        title="T.gemm matmul (GemmScalar fallback), fp32",
+        title="T.gemm matmul (GemmVector + wide VLEN copy), fp32",
         metadata={"m": args.gemm_m, "n": args.gemm_n, "k": args.gemm_k, "dtype": "float32"},
     )
     r.numeric = "n/a" if args.no_numeric else numeric_check_matmul(

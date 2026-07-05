@@ -365,7 +365,7 @@ def build_flash_attention_decode_kernel(
 #   backend="cpu"  — host ``llvm`` + ``tvm_ffi`` (RVV numeric-validation path).
 #                    The riscv64 RVV artifacts are not host-runnable, so kernel
 #                    correctness is gated on the *identical* CPU tile-op lowering
-#                    (fragment layouts, GemmScalar, CPU reduce, skipped software
+#                    (fragment layouts, GemmVector, CPU reduce, skipped software
 #                    pipeline, tl.infinity) that the .s artifacts are retargeted
 #                    from.  Bit-exact RVV execution needs Spike/Verilator.
 def _compile_attention_kernel(builder, build_args: tuple, out_idx: int, backend: str):

@@ -1,7 +1,7 @@
 # TileLang Backend Handoff
 
 Branch: `jby123/tilelang-demo`  
-Last updated: 2026-06-25
+Last updated: 2026-06-29
 
 This document is the entry point for future agent sessions working on the
 hardware-agnostic TileLang backend for nano-vllm. Read this before changing
@@ -29,6 +29,9 @@ for host orchestration and retargetable device lowering.
 - **CPU / RVV backend (Path B)** — the *same* attention `@T.prim_func` kernels lower
   through TileLang's CPU/`llvm` pipeline to RISC-V Vector (RVV) assembly, with host
   **numeric validation** against the PyTorch golden (see `tilelang.md`, `attention.md` §10)
+- **Wide RVV vectorization** — `GemmVector` (`i,k` + parallel `j`) for `T.gemm`;
+  VLEN-aware `VectorizePlanner` for `T.copy`; `rvv_target(nr_lanes=4)` with
+  `+zvl4096b` + `vector-width: 4096` (see `tilelang.md` §6)
 
 Prefill and decode are separate kernels/stages so each can be lowered, dumped,
 and benchmarked independently across hardware (e.g. GPU vs vector processor).
@@ -37,8 +40,9 @@ implementation in `backends/tilelang/attention.py` — the kernels never diverge
 
 **Next milestones:** paged KV cache store/gather (replace the dense decode cache
 with block tables), then additional Qwen3 layers until the full inference path
-can run through compiled backends. On the RVV side: AraXL-specific layout / unit-
-stride copies and Spike/Verilator execution (see `tilelang.md` §7).
+can run through compiled backends. On the RVV side: larger VLEN-aligned tiles,
+AraXL Option-A softmax reductions + software `exp2`, VRF-aware tiling, and
+Spike/Verilator execution (see `tilelang.md` §7–8, `memory.md`).
 
 ---
 
@@ -226,7 +230,7 @@ TileLang Python (@T.prim_func)
 [pending]          paged KV cache store/gather (block tables, Triton store today)
 [pending]          MLP, RMSNorm, RoPE, LM head, sampling
 [pending]          ModelRunner integration + CUDA graph bypass for compiled ops
-[pending]          RVV: AraXL layout/unit-stride copies, Spike/Verilator execution
+[pending]          RVV: VLEN-aligned tiles, Option-A softmax + exp2 poly, VRF-aware tiling, Spike/Verilator
 ```
 
 ---
@@ -419,6 +423,16 @@ The *same* prefill/decode `@T.prim_func` kernels lower through TileLang's CPU/`l
 pipeline to RISC-V Vector assembly (no algorithm rewrite). Full details in
 `tilelang.md`; run guide in `attention.md` §10.
 
+**Wide vectorization follow-up (TileLang fork + harness):**
+
+- `GemmVector.lower()` emits `for i,k` + `for j in T.parallel(N)` so LLVM
+  vectorizes unit-stride `B[k,:]` / `C[i,:]` with `vfmacc` (replaces scalar
+  `i,j,k` + hope-LLVM-finds-it).
+- `VectorizePlanner` in `loop_vectorize.cc` uses `TargetLLVMVectorWidthBits`
+  (4096 for default AraXL 4-lane) so `T.copy` is not stuck at 4 fp32/step.
+- `rvv_target(nr_lanes=4)` sets `+zvl4096b` and `vector-width: 4096`; lowering
+  must run inside `with rvv:` so `Target::Current()` is visible to the planner.
+
 - `run_tilelang_attention_{prefill,decode}(..., backend="cpu")` compile via host
   `llvm` + `tvm_ffi`; `AttentionStage(tilelang_backend="cpu", device="cpu")` drives
   the engine-aligned path without a GPU.
@@ -506,5 +520,6 @@ Before merging new backend work:
 ---
 
 *This handoff reflects the embedding + FlashAttention (CUDA) + CPU/RVV (Path B)
-milestones on branch `jby123/tilelang-demo`. Update this file when adding kernels,
-changing artifact layout, or integrating into `ModelRunner`.*
++ wide vectorization milestones on branch `jby123/tilelang-demo`. Update this
+file when adding kernels, changing artifact layout, or integrating into
+`ModelRunner`.*

@@ -89,9 +89,9 @@ Kernel ladder, written under `demos/build_rvv/<name>/`:
 | Kernel | Status | Notes |
 |--------|--------|-------|
 | `elementwise` | compiles + vectorizes | unit-stride `vle`/`vse`/`vfadd` |
-| `matmul` (`T.gemm`) | compiles + vectorizes | `GemmScalar` + LLVM auto-vec |
-| `attention_decode` | compiles + vectorizes | FlashAttention decode; numeric pass (host llvm) |
-| `attention_prefill` | compiles + vectorizes | FlashAttention prefill; numeric pass (host llvm) |
+| `matmul` (`T.gemm`) | compiles + vectorizes | `GemmVector` (`i,k` + parallel `j`) → `vfmacc` |
+| `attention_decode` | compiles + vectorizes | FlashAttention decode; both GEMMs (incl. `Q@Kᵀ`) via `GemmVector`; numeric pass (host llvm) |
+| `attention_prefill` | compiles + vectorizes | FlashAttention prefill; both GEMMs (incl. `Q@Kᵀ`) via `GemmVector`; numeric pass (host llvm) |
 
 ```
 demos/build_rvv/
