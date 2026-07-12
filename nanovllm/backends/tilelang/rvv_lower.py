@@ -10,8 +10,8 @@ auto-vectorization enabled, and emit the artifact triple per kernel:
   * ``<name>.ll``  — LLVM IR for the RVV target.
   * ``<name>.s``   — RVV assembly.
 
-This is the RVV artifact harness described in ``tilelang.md`` and
-``attention.md`` §10. It drives existing TileLang ``@T.prim_func`` kernels
+This is the RVV artifact harness described in ``usage.md`` and
+``background.md``. It drives existing TileLang ``@T.prim_func`` kernels
 through TileLang's CPU/``llvm`` pass pipeline (with Path B CPU tile-op support)
 configured for a RISC-V Vector target, with LLVM auto-vectorization enabled.
 
@@ -19,7 +19,7 @@ Path B extended TileLang so GPU-style fragments, shared tiles, ``T.gemm``,
 ``T.reduce_*``, and ``tl.infinity`` lower on CPU/``llvm``. LLVM still performs
 vector scheduling — this harness does not implement custom LMUL tuning or
 AraXL-specific codegen. Remaining limitations are documented in
-``STAGE1_REPORT.md`` §6 and ``tilelang.md`` §6.
+``STAGE1_REPORT.md`` and ``implementation_plan.md``.
 
 The RVV target mirrors AraXL's TVM flow
 (``AraXL/tvm-apps/kernels/common/common.py``): ``llvm`` backend,
@@ -33,6 +33,7 @@ TileLang's ``@T.prim_func`` type parsing.
 import json
 import os
 import re
+import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -41,7 +42,12 @@ import torch
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.engine.lower import host_codegen, lower_to_host_device_ir
+from tilelang.engine.lower import (
+    device_codegen,
+    device_codegen_without_compile,
+    host_codegen,
+    lower_to_host_device_ir,
+)
 
 from nanovllm.backends.tilelang.golden_log import (
     compare_and_log,
@@ -54,13 +60,11 @@ from nanovllm.backends.tilelang.golden_log import (
 DEFAULT_MTRIPLE = "riscv64-unknown-elf"
 # VLEN = 1024 bits × nr_lanes; default 4 lanes → +zvl4096b (AraXL).
 DEFAULT_NR_LANES = 4
-DEFAULT_MATTR = (
-    "+v",
-    "+m",
-    "+f",
-    "+d",
-    f"+zvl{1024 * DEFAULT_NR_LANES}b",
-)  # +v=RVV1.0, +m=mul/div, +f/+d=fp32/fp64
+# Base ISA attrs only (+v=RVV1.0, +m=mul/div, +f/+d=fp32/fp64). The +zvl*b VLEN
+# attr is injected by rvv_target() from nr_lanes so it can never desync from
+# vector-width — a stale +zvl in the default used to silently outrank --nr-lanes
+# (see implementation_plan.md Phase 1).
+DEFAULT_MATTR = ("+v", "+m", "+f", "+d")
 DEFAULT_MABI = "lp64d"
 
 # RVV instruction families used to prove vectorization actually happened (T3).
@@ -69,8 +73,9 @@ _RVV_VECTOR_RE = re.compile(
     r"vf[a-z]+\.[vwf]+|vfmacc|vfmadd|vfredusum|vfredosum|vfredmax|vfredmin|"
     r"vfmv|vmv|vadd|vmul|vfmul|vfadd|vfsub|vfdiv|vfmax|vfmin|vrgather)\b"
 )
-# Strided / indexed memory ops AraXL CANNOT execute (unit-stride only,
-# tilelang.md §6 limitation #5). Recorded as evidence in the report.
+# Strided / indexed memory ops (vlse/vsse/vluxei/...). The target ISA sim
+# supports these, so they are recorded for information (they keep loops
+# vectorized), not flagged as illegal. See background.md.
 _RVV_STRIDED_RE = re.compile(r"\b(vlse\d+|vsse\d+|vl[ou]xei\d+|vs[ou]xei\d+)\b")
 
 
@@ -82,16 +87,19 @@ def rvv_target(
 ) -> tvm.target.Target:
     """Build the AraXL RVV ``llvm`` target. ``mattr`` may be a list/tuple/str.
 
-    ``nr_lanes`` sets ``+zvl{1024*nr_lanes}b`` when no ``+zvl`` entry is present.
-    Pass an explicit ``mattr`` list to override VLEN entirely.
+    ``nr_lanes`` is the single source of truth for VLEN: it sets both
+    ``vector-width`` and ``+zvl{1024*nr_lanes}b``. Any ``+zvl*`` already in
+    ``mattr`` is stripped and replaced so LLVM's effective VLEN (derived from
+    ``+zvl`` on RISC-V) can never desync from ``vector-width``. Pass a different
+    ``nr_lanes`` to change VLEN; do not hand-tune ``+zvl`` in ``mattr``.
     """
     if isinstance(mattr, str):
         mattr = [tok.strip() for tok in mattr.split(",") if tok.strip()]
     else:
         mattr = list(mattr)
     vlen_bits = 1024 * nr_lanes
-    if not any(tok.startswith("+zvl") for tok in mattr):
-        mattr = [*mattr, f"+zvl{vlen_bits}b"]
+    mattr = [tok for tok in mattr if not tok.startswith("+zvl")]
+    mattr.append(f"+zvl{vlen_bits}b")
     return tvm.target.Target(
         {
             "kind": "llvm",
@@ -101,6 +109,33 @@ def rvv_target(
             "vector-width": vlen_bits,
         }
     )
+
+
+def vlen_f32_elements(nr_lanes: int) -> int:
+    """fp32 elements per cluster at LMUL=1 for an AraXL ``nr_lanes`` config
+    (``VLEN_bits / 32``): 128 @ 4 lanes, 256 @ 8 lanes. Used to size attention
+    tiles (``block_N``) to the target vector width so reduce/GEMM fill the
+    hardware vector instead of the GPU-shaped constant 128."""
+    return (1024 * nr_lanes) // 32
+
+
+def assert_target_vlen(target: tvm.target.Target, nr_lanes: int) -> int:
+    """Fail loudly if LLVM's effective VLEN (from ``+zvl*b``) does not equal
+    ``1024 * nr_lanes``. Guards against a stale ``+zvl`` in ``--mattr`` silently
+    overriding ``--nr-lanes`` (implementation_plan.md Phase 1). Returns the
+    verified width in bits."""
+    from tvm.target.codegen import llvm_get_vector_width
+
+    expected = 1024 * nr_lanes
+    with target:
+        actual = llvm_get_vector_width()
+    if actual != expected:
+        raise ValueError(
+            f"RVV target VLEN mismatch: llvm_get_vector_width()={actual} bits but "
+            f"nr_lanes={nr_lanes} implies {expected} bits. The +zvl*b attr and "
+            f"nr_lanes are out of sync (see usage.md)."
+        )
+    return actual
 
 
 def scan_rvv_ops(asm: str) -> tuple[list[str], list[str]]:
@@ -124,6 +159,22 @@ class LowerResult:
     vector_ops: list[str] = field(default_factory=list)
     strided_ops: list[str] = field(default_factory=list)
     numeric: str | None = None  # "pass" / "fail: ..." / "n/a"
+    compile_ms: float | None = None
+
+    @property
+    def vectorized(self) -> bool:
+        return bool(self.vector_ops)
+
+
+@dataclass
+class RvvCompileTiming:
+    """Wall time for the RVV llvm lowering pipeline (no artifact I/O)."""
+
+    compile_ms: float
+    compiled: bool
+    error: str | None = None
+    error_pass: str | None = None
+    vector_ops: list[str] = field(default_factory=list)
 
     @property
     def vectorized(self) -> bool:
@@ -144,6 +195,65 @@ def _short_error(exc: Exception) -> tuple[str, str | None]:
     pass_match = re.findall(r"tilelang\.transform\.(\w+)\(\)", tb)
     cpu_pass = pass_match[-1] if pass_match else None
     return one_line, cpu_pass
+
+
+def time_tilelang_lower(
+    func,
+    target: tvm.target.Target,
+    *,
+    codegen: str = "host",
+    target_host: tvm.target.Target | None = None,
+) -> RvvCompileTiming:
+    """Time TileLang ``lower_to_host_device_ir`` + codegen without JIT or device launch.
+
+    ``codegen`` selects the timed backend stage:
+
+    * ``host`` — ``host_codegen`` + ``inspect_source`` (llvm/asm for CPU paths)
+    * ``device_source`` — ``device_codegen_without_compile`` (``.cu`` text, no nvcc)
+    * ``device_nvcc`` — full ``device_codegen`` (nvcc/cubin; may fail on old host GCC)
+    """
+    resolved_host = target_host or target
+    t0 = time.perf_counter()
+    try:
+        with target:
+            host_mod, device_mod, _params, tgt, tgt_host = lower_to_host_device_ir(
+                func, target=target, target_host=resolved_host
+            )
+            vector_ops: list[str] = []
+            if codegen == "host":
+                rt_mod = host_codegen(host_mod, target_host=tgt_host, target=tgt)
+                asm = rt_mod.inspect_source("asm")
+                vector_ops, _strided = scan_rvv_ops(asm)
+            elif codegen == "device_source":
+                codegen_mod = device_codegen_without_compile(device_mod, tgt)
+                codegen_mod.inspect_source()
+            elif codegen == "device_nvcc":
+                codegen_mod = device_codegen(device_mod, tgt)
+                codegen_mod.inspect_source()
+            else:
+                raise ValueError(f"unknown codegen mode: {codegen!r}")
+        return RvvCompileTiming(
+            compile_ms=(time.perf_counter() - t0) * 1000.0,
+            compiled=True,
+            vector_ops=vector_ops,
+        )
+    except Exception as exc:  # noqa: BLE001
+        one_line, cpu_pass = _short_error(exc)
+        return RvvCompileTiming(
+            compile_ms=(time.perf_counter() - t0) * 1000.0,
+            compiled=False,
+            error=one_line,
+            error_pass=cpu_pass,
+        )
+
+
+def time_rvv_lower(func, target: tvm.target.Target) -> RvvCompileTiming:
+    """Time TileLang CPU/llvm lowering through the RVV target (no disk writes).
+
+    Runs ``lower_to_host_device_ir`` + ``host_codegen`` and touches ``.s`` so
+    LLVM codegen is included in the timing.
+    """
+    return time_tilelang_lower(func, target, codegen="host", target_host=target)
 
 
 def lower_kernel_rvv(
@@ -174,6 +284,9 @@ def lower_kernel_rvv(
         name=name, title=title, build_dir=build_dir, compiled=False, tir_path=tir_path
     )
 
+    t0 = time.perf_counter()
+    one_line: str | None = None
+    cpu_pass: str | None = None
     try:
         with target:
             host_mod, device_mod, _params, tgt, tgt_host = lower_to_host_device_ir(
@@ -196,11 +309,15 @@ def lower_kernel_rvv(
         one_line, cpu_pass = _short_error(exc)
         result.error = one_line
         result.error_pass = cpu_pass
+    finally:
+        result.compile_ms = (time.perf_counter() - t0) * 1000.0
+
+    if not result.compiled and result.error:
         # No lowered TIR available; keep the source TIR so <name>.tir exists.
         annotated = (
             f"# NOTE: CPU/llvm (RVV) lowering FAILED for this kernel.\n"
             f"# Failing TileLang pass: {cpu_pass or '<unknown>'}\n"
-            f"# Error: {one_line}\n"
+            f"# Error: {one_line or result.error}\n"
             f"# The body below is the SOURCE TensorIR (pre-pipeline), not the\n"
             f"# lowered output. See metadata.json / STAGE1_REPORT.md for details.\n\n"
             f"{source_tir}\n"
@@ -223,6 +340,7 @@ def lower_kernel_rvv(
         "strided_ops": result.strided_ops,
         "error": result.error,
         "error_pass": result.error_pass,
+        "compile_ms": result.compile_ms,
         "llvm_enabled": bool(tvm.runtime.enabled("llvm")),
         "generated_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -250,7 +368,7 @@ Files:
   golden.log         PyTorch golden comparison (when numeric checks run).
 
 Vectorization (RVV ops detected in {name}.s): {result.vector_ops or 'none'}
-Strided/indexed ops (AraXL is unit-stride only): {result.strided_ops or 'none'}
+Strided/indexed ops (supported by target sim; informational): {result.strided_ops or 'none'}
 
 This is a DEMO of what TileLang + LLVM already do today. It performs no custom
 vector lowering, LMUL tuning, or AraXL-specific codegen. See STAGE1_REPORT.md

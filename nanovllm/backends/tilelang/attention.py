@@ -33,6 +33,41 @@ from tilelang import tvm as tvm
 # kernel use a single fused-multiply for the softmax exponent.
 LOG2E = 1.44269504
 
+# Cephes single-precision 2**x polynomial (coeffs P0..P5, Horner) for the
+# argument-reduced fractional part r in [-0.5, 0.5]. Accuracy ~1 ulp.
+_EXP2_POLY = (
+    1.535336188319500e-4,
+    1.339887440266574e-3,
+    9.618437357674640e-3,
+    5.550332471162809e-2,
+    2.402264791363012e-1,
+    6.931472028550421e-1,
+)
+
+
+def _exp2_poly(x):
+    """Vectorizable software ``2**x`` for the softmax exponent (Phase 2).
+
+    ``T.exp2`` lowers to a scalar ``call exp2f`` on the CPU/RVV path, which
+    prevents LLVM from vectorizing the softmax loops. This inlines the Cephes
+    ``exp2f`` polynomial in pure arithmetic + an integer reinterpret so the whole
+    expression vectorizes (``vfcvt`` / ``vfmadd`` / ``vsll``) instead of calling
+    libm per element. Argument reduction ``2**x = 2**n * 2**r`` with
+    ``n = round(x)`` and ``r in [-0.5, 0.5]``; ``2**n`` is built directly in the
+    fp32 exponent field. Softmax exponents are ``<= 0`` (post max-subtract); the
+    clamp flushes ``2**x`` to 0 for very negative / masked (``-inf``) inputs,
+    matching ``exp2``. Used only on the vector path; CUDA keeps hardware ``exp2``.
+    """
+    x = T.max(x, T.float32(-127.0))
+    n = T.floor(x + T.float32(0.5))
+    r = x - n
+    q = T.float32(_EXP2_POLY[0])
+    for coeff in _EXP2_POLY[1:]:
+        q = q * r + T.float32(coeff)
+    two_r = q * r + T.float32(1.0)
+    pow2n = T.reinterpret(T.shift_left(T.Cast("int32", n) + 127, 23), "float32")
+    return two_r * pow2n
+
 # Pass configs shared by both attention kernels.
 #
 # Why TL_DISABLE_WARP_SPECIALIZED:
@@ -104,6 +139,7 @@ def build_flash_attention_prefill_kernel(
     num_stages: int = 1,
     threads: int = 128,
     in_dtype: str = "float16",
+    vec_exp2: bool = False,
 ):
     """Packed (unpadded) varlen FlashAttention, right-aligned causal masking.
 
@@ -114,11 +150,21 @@ def build_flash_attention_prefill_kernel(
       cu_seqlens_q / cu_seqlens_k : (batch_size + 1,) int32 prefix sums
       max_seqlen_q : runtime scalar
       -> Output_unpad : (total_q, num_heads, head_dim)
+
+    ``vec_exp2`` (vector/RVV path, off for CUDA) uses the inlined polynomial
+    ``2**x`` so softmax vectorizes instead of calling scalar ``exp2f`` (Phase 2).
     """
     assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
     group_size = num_heads // num_kv_heads
     scale = softmax_scale * LOG2E
     accum_dtype = "float32"
+
+    def _exp2(v):
+        return _exp2_poly(v) if vec_exp2 else T.exp2(v)
+
+    # Skip the acc_s_cast buffer + copy when acc (fp32) already is in_dtype
+    # (fp32 vector path); fp16 (CUDA tensor-core) still needs the cast (Phase 3).
+    need_cast = in_dtype != accum_dtype
 
     q_shape = [total_q, num_heads, head_dim]
     kv_shape = [total_kv, num_kv_heads, head_dim]
@@ -142,7 +188,8 @@ def build_flash_attention_prefill_kernel(
             V_shared = T.alloc_shared([block_N, head_dim], in_dtype)
             O_shared = T.alloc_shared([block_M, head_dim], in_dtype)
             acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
-            acc_s_cast = T.alloc_fragment([block_M, block_N], in_dtype)
+            if need_cast:
+                acc_s_cast = T.alloc_fragment([block_M, block_N], in_dtype)
             acc_o = T.alloc_fragment([block_M, head_dim], accum_dtype)
             scores_max = T.alloc_fragment([block_M], accum_dtype)
             scores_max_prev = T.alloc_fragment([block_M], accum_dtype)
@@ -212,13 +259,14 @@ def build_flash_attention_prefill_kernel(
                     scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
 
                 for i in T.Parallel(block_M):
-                    scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                    scores_scale[i] = _exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
                 for i, j in T.Parallel(block_M, block_N):
-                    acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                    acc_s[i, j] = _exp2(acc_s[i, j] * scale - scores_max[i] * scale)
                 T.reduce_sum(acc_s, scores_sum, dim=1)
                 for i in T.Parallel(block_M):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)
+                if need_cast:
+                    T.copy(acc_s, acc_s_cast)
 
                 for i, j in T.Parallel(block_M, head_dim):
                     acc_o[i, j] *= scores_scale[i]
@@ -228,7 +276,7 @@ def build_flash_attention_prefill_kernel(
                     V_shared,
                 )
 
-                T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(acc_s_cast if need_cast else acc_s, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             for i, j in T.Parallel(block_M, head_dim):
                 # Queries that can see nothing (right-aligned offset) emit zeros.
@@ -263,6 +311,7 @@ def build_flash_attention_decode_kernel(
     num_stages: int = 2,
     threads: int = 128,
     in_dtype: str = "float16",
+    vec_exp2: bool = False,
 ):
     """One query token per sequence attending to ``seqlen_kv`` cached keys.
 
@@ -276,12 +325,23 @@ def build_flash_attention_decode_kernel(
     ``seqlen_kv`` is the padded cache length (multiple of ``block_N``); the mask
     encodes each sequence's real ``context_len``. GQA query heads sharing a kv
     head are batched into the ``block_H`` (M) dimension.
+
+    ``vec_exp2`` (vector/RVV path, off for CUDA) uses the inlined polynomial
+    ``2**x`` so softmax vectorizes instead of calling scalar ``exp2f`` (Phase 2).
     """
     assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
     scale = softmax_scale * LOG2E
     accum_dtype = "float32"
     kv_group_num = num_heads // num_kv_heads
     valid_block_H = min(block_H, kv_group_num)
+
+    def _exp2(v):
+        return _exp2_poly(v) if vec_exp2 else T.exp2(v)
+
+    # The P @ V input must match the GEMM's in_dtype. When acc (fp32) already is
+    # in_dtype (fp32 vector path), skip the separate acc_s_cast buffer + copy
+    # and feed acc_s straight in (Phase 3); fp16 (CUDA) still needs the cast.
+    need_cast = in_dtype != accum_dtype
 
     shape_q = [batch_size, num_heads, head_dim]
     shape_kv = [batch_size, seqlen_kv, num_kv_heads, head_dim]
@@ -302,7 +362,8 @@ def build_flash_attention_decode_kernel(
             V_shared = T.alloc_shared([block_N, head_dim], in_dtype)
             O_shared = T.alloc_shared([valid_block_H, head_dim], in_dtype)
             acc_s = T.alloc_fragment([block_H, block_N], accum_dtype)
-            acc_s_cast = T.alloc_fragment([block_H, block_N], in_dtype)
+            if need_cast:
+                acc_s_cast = T.alloc_fragment([block_H, block_N], in_dtype)
             mask_local = T.alloc_fragment([block_N], "uint8")
             acc_o = T.alloc_fragment([block_H, head_dim], accum_dtype)
             scores_max = T.alloc_fragment([block_H], accum_dtype)
@@ -336,17 +397,18 @@ def build_flash_attention_decode_kernel(
                 for i in T.Parallel(block_H):
                     scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
                 for i in T.Parallel(block_H):
-                    scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                    scores_scale[i] = _exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
                 for i, j in T.Parallel(block_H, block_N):
-                    acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                    acc_s[i, j] = _exp2(acc_s[i, j] * scale - scores_max[i] * scale)
                 T.reduce_sum(acc_s, scores_sum, dim=1)
                 for i in T.Parallel(block_H):
                     logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)
+                if need_cast:
+                    T.copy(acc_s, acc_s_cast)
                 for i, j in T.Parallel(block_H, head_dim):
                     acc_o[i, j] *= scores_scale[i]
                 T.copy(V[bid, k * block_N : (k + 1) * block_N, cur_kv_head, :], V_shared)
-                T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(acc_s_cast if need_cast else acc_s, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             for i, j in T.Parallel(block_H, head_dim):
                 acc_o[i, j] /= logsum[i]
@@ -436,9 +498,11 @@ def run_tilelang_attention_prefill(
         k_pad[:total_kv] = k
         v_pad[:total_kv] = v
 
+    # Vector-friendly software exp2 on the CPU/RVV path; CUDA keeps hardware exp2.
     build_args = (
         batch_size, padded_q, padded_kv, num_heads, num_kv_heads, head_dim,
         float(softmax_scale), is_causal, block_M, block_N, num_stages, threads, in_dtype,
+        backend == "cpu",
     )
     kernel = _compile_attention_kernel(build_flash_attention_prefill_kernel, build_args, 6, backend)
     out = kernel(
@@ -488,9 +552,11 @@ def run_tilelang_attention_decode(
         )
     in_dtype = tilelang_dtype(q.dtype)
 
+    # Vector-friendly software exp2 on the CPU/RVV path; CUDA keeps hardware exp2.
     build_args = (
         batch_size, seqlen_kv, num_heads, num_kv_heads, head_dim,
         float(softmax_scale), block_N, block_H, num_stages, threads, in_dtype,
+        backend == "cpu",
     )
     kernel = _compile_attention_kernel(build_flash_attention_decode_kernel, build_args, 4, backend)
     return kernel(

@@ -6,12 +6,18 @@ RVV artifacts on the host ``llvm`` backend (``AttentionStage(tilelang_backend=
 "cpu")``) and compares against the pure-PyTorch float32 golden.  This is the
 runnable proxy for the riscv64 RVV ``.s`` artifacts, which are not host-runnable.
 
-Requires the Path B TileLang dev build on ``PYTHONPATH`` (see ``tilelang.md``).
+Requires the Path B TileLang dev build on ``PYTHONPATH`` (see ``usage.md``).
 Skips cleanly if TileLang / an LLVM-enabled TVM is unavailable.
 
 Run:
 
     pytest tests/test_attention_rvv_numeric.py -v
+
+Lab-meeting table (max_abs_diff, compile/exec timing, coverage notes)::
+
+    python demos/matrix_report.py --out-dir demos/build_rvv --slide
+    python demos/matrix_report.py --slide-only --out-dir demos/build_rvv
+    python demos/matrix_report.py --rvv-compile-only --out-dir demos/build_rvv
 
 The matrix is intentionally diverse but bounded (compilation dominates runtime;
 TileLang caches per shape).  fp32 host tolerance is loose vs the ~1e-6 observed

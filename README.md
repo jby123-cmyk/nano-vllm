@@ -43,6 +43,18 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## RVV / TileLang (AraXL)
+
+CPU RISC-V Vector lowering for FlashAttention is documented separately:
+
+- `usage.md` — build, target setup, run the lowering ladder, validate results
+- `background.md` — pipeline architecture and how it differs from CUDA TileLang
+- `implementation_plan.md` — current vectorization state and next optimization steps
+
+```bash
+python demos/run_rvv_lower.py --nr-lanes 4 --mattr +v,+m,+f,+d,+zvl4096b
+```
+
 ## Benchmark
 
 See `bench.py` for benchmark.

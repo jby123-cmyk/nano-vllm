@@ -3,13 +3,34 @@ Stage 1 demo: drive TileLang kernels through the CPU/``llvm`` pipeline at an
 AraXL RISC-V Vector (RVV) target and emit ``<name>.tir`` / ``<name>.ll`` /
 ``<name>.s`` per kernel, then write ``STAGE1_REPORT.md``.
 
-This is the reproducible Stage 1 command from ``tilelang.md``. It runs a
+This is the reproducible Stage 1 command from ``usage.md``. It runs a
 kernel ladder from trivial to the real thing:
 
   (a) elementwise add          — unit-stride vector copy/add
   (b) T.gemm matmul            — GemmVector parallel-N vfmacc nest
   (c) FlashAttention decode    — the real decode kernel (fp32)
   (d) FlashAttention prefill   — the real prefill kernel (fp32)
+
+CPU/``llvm`` pass pipeline (see ``tilelang/cpu/pipeline.py``):
+
+  Simplify → … → SerializeOuterParallel → LayoutInference → LowerTileOp
+  → VectorizeLoop → LLVM codegen → RVV assembly
+
+  ``SerializeOuterParallel`` (Phase 4) runs before ``LayoutInference`` and
+  restructures multi-axis ``T.Parallel`` elementwise nests for CPU vectorization:
+  outer parallel axes become serial, loop-invariant loads are hoisted, and the
+  innermost axis becomes the vector lane. GPU pipelines are untouched.
+
+Attention kernels use the natural ``T.Parallel(M, N)`` form (no CPU-specific
+loop reshaping in the kernel source). Vectorization comes from the compiler:
+
+  - Phase 2: inline Cephes ``2**x`` polynomial replaces scalar ``exp2f`` (libm)
+  - Phase 3: ``acc_s`` feeds ``P @ V`` directly when ``in_dtype == accum_dtype``
+  - Phase 4: ``SerializeOuterParallel`` vectorizes softmax exponent, ``acc_o``
+    rescale, final divide, and prefill's fp32 mask
+
+GEMM (``GemmVector`` → ``vfmacc``) and reduce (``vle`` + ``vfredmax``/``vfredusum``)
+were already vector and are unchanged by Phases 2–4.
 
 Default run (AraXL RVV target, demos/build_rvv/, numeric checks on):
 
@@ -41,7 +62,9 @@ from nanovllm.backends.tilelang.rvv_lower import (
     DEFAULT_MABI,
     DEFAULT_MATTR,
     DEFAULT_MTRIPLE,
+    DEFAULT_NR_LANES,
     LowerResult,
+    assert_target_vlen,
     build_elementwise_kernel,
     build_matmul_kernel,
     lower_kernel_rvv,
@@ -50,6 +73,7 @@ from nanovllm.backends.tilelang.rvv_lower import (
     numeric_check_attention_decode,
     numeric_check_attention_prefill,
     rvv_target,
+    vlen_f32_elements,
 )
 
 
@@ -62,8 +86,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--nr-lanes",
         type=int,
-        default=4,
-        help="AraXL lane count; sets +zvl{1024*nr_lanes}b when mattr has no +zvl (default 4 → VLEN 4096).",
+        default=DEFAULT_NR_LANES,
+        help="AraXL lane count; sole source of VLEN = 1024*nr_lanes bits "
+        "(default 4 → VLEN 4096, block_N 128; 8 → VLEN 8192, block_N 256).",
     )
     # Elementwise / gemm shapes
     p.add_argument("--elem-n", type=int, default=4096, help="Elementwise vector length.")
@@ -103,13 +128,15 @@ def build_report(results: list[LowerResult], target_str: str, out_dir: str) -> s
     a(f"_Generated: {now}_\n")
     a(f"_Target: `{target_str}`_\n")
     a(
-        "\nThis report records the **demo** described in `tilelang.md`: TileLang "
-        "kernels routed through the CPU/`llvm` pass pipeline at the AraXL RVV target, "
-        "with LLVM auto-vectorization on. **Path B** TileLang backend work (see "
-        "`tilelang.md`) added CPU realizations for GPU-style tile ops so FlashAttention "
-        "decode/prefill lower end-to-end; LLVM still owns vector scheduling (no custom "
-        "LMUL tuning or AraXL subtarget). Remaining limitations are **observed in the "
-        "artifacts**, not hidden.\n"
+        "\nThis report records the **demo** described in `usage.md`: TileLang "
+        "kernels routed through the CPU/`llvm` pass pipeline at the AraXL RVV target. "
+        "The pipeline includes `SerializeOuterParallel` (Phase 4), which restructures "
+        "multi-axis `T.Parallel` elementwise nests before `LayoutInference` so LLVM "
+        "can vectorize softmax exponent, rescale, divide, and fp32 mask loops. "
+        "GEMM (`GemmVector` → `vfmacc`) and reduce (`vle` + `vfred`) were already "
+        "vector and are unchanged. LLVM still owns final VL/LMUL scheduling (no "
+        "custom subtarget). Remaining limitations are **observed in the artifacts**, "
+        "not hidden.\n"
     )
 
     a("\n## Reproduce\n")
@@ -141,7 +168,7 @@ def build_report(results: list[LowerResult], target_str: str, out_dir: str) -> s
         a(f"\n### `{r.name}`\n")
         a(f"- Artifacts: `{r.name}.tir`, `{r.name}.ll`, `{r.name}.s`")
         a(f"- Vector ops: `{', '.join(r.vector_ops) or 'none'}`")
-        a(f"- Strided/indexed ops (AraXL unit-stride only): `{', '.join(r.strided_ops) or 'none'}`")
+        a(f"- Strided/indexed ops (supported by target sim; informational): `{', '.join(r.strided_ops) or 'none'}`")
         snip = _snippet(r.s_path)
         if snip:
             a("\n```asm")
@@ -180,7 +207,9 @@ def _limitations_section(results: list[LowerResult]) -> str:
         "`GemmVector` on `llvm`: a `serial i,k` + `parallel j` nest with the "
         "output-`N` axis vectorized (`vfmacc` on the accumulator), including the "
         "transposed `Q @ K^T` in FlashAttention (its `B[j,k]` load becomes a "
-        "strided/gather vector load). "
+        "strided/gather vector load, e.g. `vluxei64`). The target ISA sim "
+        "supports strided/indexed loads, so this keeps the score matmul fully "
+        "vectorized rather than scalarizing it. "
         + (
             f"Observed: `matmul` vectorized to `{', '.join(gemm.vector_ops[:6])}…`; "
             "LLVM still owns final VL/LMUL selection, so this is not a hand-tuned "
@@ -202,24 +231,36 @@ def _limitations_section(results: list[LowerResult]) -> str:
         "long-vector-optimal layout is a future tile-backend job."
     )
     L.append(
-        "4. **No AraXL cost/scheduling model.** The `.s` uses generic RVV "
-        "scheduling/LMUL; AraXL is not a modeled LLVM subtarget."
+        "4. **No custom cost/scheduling model.** The `.s` uses generic RVV "
+        "scheduling/LMUL; there is no target-specific LLVM subtarget yet."
     )
     L.append(
-        "5. **Unit-stride only.** AraXL cannot do strided/gather loads. "
+        "5. **Strided/indexed loads (informational, not a blocker).** The target "
+        "ISA sim supports `vlse`/`vluxei`, so these are kept when they preserve "
+        "vectorization (e.g. transposed `Q @ K^T`). "
         + (
-            f"Observed: strided/indexed ops emitted in the artifacts: "
-            f"`{', '.join(strided_seen)}` — these (e.g. `vlse32`) would not run on "
-            "AraXL and flag layouts that need contiguity fixes in a later stage."
+            f"Observed strided/indexed ops in the artifacts: "
+            f"`{', '.join(strided_seen)}` — these keep the corresponding loops "
+            "vectorized rather than falling back to scalar element loops."
             if strided_seen
-            else "No strided/indexed ops were emitted for these shapes; larger/"
-            "transposed tiles can still produce `vlse`/`vluxei`."
+            else "No strided/indexed ops were emitted for these shapes."
         )
     )
     L.append(
-        "6. **No hardware transcendental.** `exp2` (softmax) is not a vector "
-        "instruction; the baseline would scalarize it or call libm. The "
-        "polynomial-via-`call_extern` fix is future work."
+        "6. **Softmax `exp2` — vectorized (Phase 2, done).** There is no hardware "
+        "transcendental, so the baseline emitted a scalar `call exp2f` (libm) per "
+        "element and could not vectorize the softmax loop. The kernels now inline "
+        "a Cephes `2**x` polynomial (arithmetic + fp32 exponent bit-trick), so LLVM "
+        "emits vector ops (`vfcvt`, `vfmadd`, `vsll.vi`) with **zero `exp2f` "
+        "calls**."
+    )
+    L.append(
+        "6b. **Elementwise fragment loops — vectorized (Phase 4, done).** The CPU "
+        "pass `SerializeOuterParallel` serializes the outer axis of flattened 2-D "
+        "`T.Parallel` nests and hoists loop-invariant loads, so the softmax "
+        "exponent, `acc_o` rescale, final divide, and prefill's fp32 mask vectorize "
+        "generically (no attention-specific edge case). The decode `uint8`-compare "
+        "mask stays scalar — an LLVM mixed-element-width limitation."
     )
     L.append(
         "7. **fp16 not in baseline.** `+f,+d` cover fp32/fp64; fp16 needs `zvfh`. "
@@ -227,9 +268,9 @@ def _limitations_section(results: list[LowerResult]) -> str:
         "is GPU-only.)"
     )
     L.append(
-        "8. **VRF capacity / spills.** No cache sits between the VRF and L2, so "
-        "tiles exceeding the VRF spill to memory. Stage 1 does no VRF-aware "
-        "tiling; inspect each `.s` for stack spills around the vector loops."
+        "8. **Vector-register capacity / spills.** Tiles exceeding the vector "
+        "register file spill to memory. Stage 1 does no capacity-aware tiling; "
+        "inspect each `.s` for stack spills around the vector loops."
     )
 
     if decode and decode.compiled:
@@ -244,15 +285,21 @@ def _limitations_section(results: list[LowerResult]) -> str:
             "unblocked the real FlashAttention kernels on CPU/`llvm`: fragment "
             "`infer_layout`, CPU `T.reduce_*`/`T.fill`, early shared→local promotion "
             "in `LowerTileOp`, and `tl.infinity` lowering for LLVM. Both kernels now "
-            "emit `.tir`/`.ll`/`.s` with RVV ops (`vfmacc`, `vfredosum`, `vsetvli`, …). "
+            "emit `.tir`/`.ll`/`.s` with RVV ops (`vfmacc`, `vfredmax`/`vfredusum`, "
+            "`vfcvt`/`vfmadd`/`vfmul`, `vsetvli`, …). Phase 2 inlined the softmax "
+            "`exp2` polynomial (zero `exp2f` calls); Phase 3 drops the redundant "
+            "`acc_s_cast` copy on the fp32 path; Phase 4's `SerializeOuterParallel` "
+            "pass vectorizes the elementwise fragment loops generically. Decode "
+            "`block_N` is VLEN-derived (`vlen_f32_elements(nr_lanes)`); prefill "
+            "tiles remain CUDA-shaped (64×64). "
             f"{numeric_note} Run `demos/run_attention_rvv_stage.py` for a standalone "
             "golden check (mirrors `run_attention_stage.py` on CPU)."
         )
     elif decode and not decode.compiled:
         L.append(
             "\n**Attention (decode/prefill) status.** Lowering failed in "
-            f"`{decode.error_pass or 'unknown'}` — see `tilelang.md` for the Path B "
-            "backend checklist and rebuild TileLang from `/mnt/ssd/jby123/tilelang/build`."
+            f"`{decode.error_pass or 'unknown'}` — see `usage.md` and `background.md`; "
+            "rebuild TileLang from `/mnt/ssd/jby123/tilelang/build`."
         )
     return "\n".join(f"{item}\n" for item in L)
 
@@ -263,7 +310,22 @@ def main() -> int:
     target_str = str(target)
     scale = args.head_dim ** -0.5
 
+    # Fail loudly if +zvl / nr_lanes desynced (was a silent footgun).
+    vlen_bits = assert_target_vlen(target, args.nr_lanes)
+
+    # Derive decode tiles from target VLEN (Phase 1): block_N = fp32 lanes per
+    # LMUL=1 register so reduce/GEMM fill one vector; block_H = GQA group size.
+    decode_block_N = vlen_f32_elements(args.nr_lanes)
+    decode_block_H = args.num_heads // args.num_kv_heads
+    # Decode requires seqlen_kv % block_N == 0; pad the ladder KV length up.
+    decode_seqlen_kv = ((args.seqlen_kv + decode_block_N - 1) // decode_block_N) * decode_block_N
+
     print(f"RVV Stage 1 lowering — target: {target_str}")
+    print(f"VLEN: {vlen_bits} bits ({vlen_bits // 32} fp32/cluster, nr_lanes={args.nr_lanes})")
+    print(
+        f"Decode tiles (VLEN-derived): block_N={decode_block_N} block_H={decode_block_H} "
+        f"seqlen_kv={decode_seqlen_kv}"
+    )
     print(f"Artifacts root: {args.out_dir}\n")
 
     results: list[LowerResult] = []
@@ -292,18 +354,20 @@ def main() -> int:
     results.append(r)
     print(f"  [b] matmul      : compiled={r.compiled} vectorized={r.vectorized} numeric={r.numeric}")
 
-    # (c) FlashAttention decode (fp32)
+    # (c) FlashAttention decode (fp32) — VLEN-derived tiles, vec_exp2 poly,
+    # SerializeOuterParallel vectorizes elementwise loops at compile time.
     decode_tir = build_flash_attention_decode_kernel.get_tir(
-        1, args.seqlen_kv, args.num_heads, args.num_kv_heads, args.head_dim,
-        float(scale), 128, 64, 2, 128, "float32",
+        1, decode_seqlen_kv, args.num_heads, args.num_kv_heads, args.head_dim,
+        float(scale), decode_block_N, decode_block_H, 2, 128, "float32", True,
     )
     r = lower_kernel_rvv(
         decode_tir, "attention_decode", os.path.join(args.out_dir, "attention_decode"), target,
         title="FlashAttention decode (GQA KV-cache), fp32",
         metadata={
-            "phase": "decode", "batch_size": 1, "seqlen_kv": args.seqlen_kv,
+            "phase": "decode", "batch_size": 1, "seqlen_kv": decode_seqlen_kv,
             "num_heads": args.num_heads, "num_kv_heads": args.num_kv_heads,
             "head_dim": args.head_dim, "dtype": "float32",
+            "block_N": decode_block_N, "block_H": decode_block_H, "vec_exp2": True,
         },
     )
     if args.no_numeric:
@@ -320,19 +384,22 @@ def main() -> int:
     else:
         r.numeric = numeric_check_attention_decode(
             batch_size=1,
-            seqlen_kv=args.seqlen_kv,
+            seqlen_kv=decode_seqlen_kv,
             num_heads=args.num_heads,
             num_kv_heads=args.num_kv_heads,
             head_dim=args.head_dim,
+            block_N=decode_block_N,
+            block_H=decode_block_H,
             build_dir=r.build_dir,
         )
     results.append(r)
     print(f"  [c] decode      : compiled={r.compiled} vectorized={r.vectorized} numeric={r.numeric}")
 
-    # (d) FlashAttention prefill (fp32)
+    # (d) FlashAttention prefill (fp32) — CUDA-shaped 64×64 tiles (not VLEN-derived);
+    # vec_exp2 poly + SerializeOuterParallel (prefill fp32 mask vectorizes).
     prefill_tir = build_flash_attention_prefill_kernel.get_tir(
         1, args.prefill_total_q, args.seqlen_kv, args.num_heads, args.num_kv_heads, args.head_dim,
-        float(scale), True, 64, 64, 1, 128, "float32",
+        float(scale), True, 64, 64, 1, 128, "float32", True,
     )
     r = lower_kernel_rvv(
         prefill_tir, "attention_prefill", os.path.join(args.out_dir, "attention_prefill"), target,
@@ -341,7 +408,7 @@ def main() -> int:
             "phase": "prefill", "batch_size": 1, "total_q": args.prefill_total_q,
             "total_kv": args.seqlen_kv,
             "num_heads": args.num_heads, "num_kv_heads": args.num_kv_heads,
-            "head_dim": args.head_dim, "dtype": "float32",
+            "head_dim": args.head_dim, "dtype": "float32", "vec_exp2": True,
         },
     )
     if args.no_numeric:
