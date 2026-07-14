@@ -4,22 +4,22 @@ backend against a pure-PyTorch golden reference.
 
 Prefill (default) replaces ``flash_attn_varlen_func``:
 
-  python demos/run_attention_stage.py \\
+  python demos/tutorials/run_attention_stage.py \\
     --num-heads 8 --num-kv-heads 2 --head-dim 64 --seq-lens 5
 
 Decode replaces ``flash_attn_with_kvcache``:
 
-  python demos/run_attention_stage.py --decode \\
+  python demos/tutorials/run_attention_stage.py --decode \\
     --num-heads 8 --num-kv-heads 2 --head-dim 64 --context-lens 17,33
 
 Real Qwen3 dims:
 
-  python demos/run_attention_stage.py \\
+  python demos/tutorials/run_attention_stage.py \\
     --model ~/huggingface/Qwen3-0.6B/ --seq-lens 128,256
 
 Full artifact dump (TIR + host/device codegen) for the chosen phase:
 
-  python demos/run_attention_stage.py --seq-lens 128 \\
+  python demos/tutorials/run_attention_stage.py --seq-lens 128 \\
     --num-heads 8 --num-kv-heads 2 --head-dim 64 --dump-build
 
 Prefill and decode are separate kernels so each can be dumped and benchmarked on

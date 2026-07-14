@@ -10,6 +10,7 @@ kernel ladder from trivial to the real thing:
   (b) T.gemm matmul            — GemmVector parallel-N vfmacc nest
   (c) FlashAttention decode    — the real decode kernel (fp32)
   (d) FlashAttention prefill   — the real prefill kernel (fp32)
+  (e) linear GEMM              — F.linear / y = x @ W.T (fp32)
 
 CPU/``llvm`` pass pipeline (see ``tilelang/cpu/pipeline.py``):
 
@@ -34,16 +35,16 @@ were already vector and are unchanged by Phases 2–4.
 
 Default run (AraXL RVV target, demos/build_rvv/, numeric checks on):
 
-  python demos/run_rvv_lower.py
+  python demos/rvv/run_rvv_lower.py
 
 Override the target (defaults mirror AraXL tvm-apps):
 
-  python demos/run_rvv_lower.py \\
+  python demos/rvv/run_rvv_lower.py \\
     --mtriple riscv64-unknown-elf --mattr +v,+m,+f,+d --mabi lp64d
 
 Real Qwen3-ish attention dims:
 
-  python demos/run_rvv_lower.py --num-heads 16 --num-kv-heads 8 --head-dim 128
+  python demos/rvv/run_rvv_lower.py --num-heads 16 --num-kv-heads 8 --head-dim 128
 
 Everything is fp32 (the baseline; fp16 needs zvfh and is out of scope).
 """
@@ -70,6 +71,7 @@ from nanovllm.backends.tilelang.rvv_lower import (
     lower_kernel_rvv,
     numeric_check_elementwise,
     numeric_check_matmul,
+    numeric_check_linear,
     numeric_check_attention_decode,
     numeric_check_attention_prefill,
     rvv_target,
@@ -141,7 +143,7 @@ def build_report(results: list[LowerResult], target_str: str, out_dir: str) -> s
 
     a("\n## Reproduce\n")
     a("```bash")
-    a("python demos/run_rvv_lower.py")
+    a("python demos/rvv/run_rvv_lower.py")
     a("```")
 
     a("\n## Per-kernel results\n")
@@ -292,7 +294,7 @@ def _limitations_section(results: list[LowerResult]) -> str:
             "pass vectorizes the elementwise fragment loops generically. Decode "
             "`block_N` is VLEN-derived (`vlen_f32_elements(nr_lanes)`); prefill "
             "tiles remain CUDA-shaped (64×64). "
-            f"{numeric_note} Run `demos/run_attention_rvv_stage.py` for a standalone "
+            f"{numeric_note} Run `demos/rvv/run_attention_rvv_stage.py` for a standalone "
             "golden check (mirrors `run_attention_stage.py` on CPU)."
         )
     elif decode and not decode.compiled:
@@ -434,6 +436,39 @@ def main() -> int:
         )
     results.append(r)
     print(f"  [d] prefill     : compiled={r.compiled} vectorized={r.vectorized} numeric={r.numeric}")
+
+    # (e) Linear GEMM (F.linear) — PyTorch layout weight [out, in], transpose_B.
+    from nanovllm.backends.tilelang.linear import build_linear_kernel
+
+    lin_m, lin_k, lin_n = 64, 128, 256
+    linear_tir = build_linear_kernel.get_tir(
+        lin_m, lin_k, lin_n, False, 64, 64, 64, 128, "float32"
+    )
+    r = lower_kernel_rvv(
+        linear_tir, "linear", os.path.join(args.out_dir, "linear"), target,
+        title="Linear GEMM (F.linear / y = x @ W.T), fp32",
+        metadata={
+            "num_tokens": lin_m, "in_features": lin_k, "out_features": lin_n,
+            "has_bias": False, "dtype": "float32",
+        },
+    )
+    if args.no_numeric:
+        r.numeric = "n/a"
+    elif not r.compiled:
+        write_skipped_golden_log(
+            r.build_dir,
+            demo="rvv_lower/linear",
+            reference="torch.nn.functional.linear",
+            backend="tilelang host llvm + tvm_ffi (backend=cpu)",
+            reason=f"RVV lowering failed before numeric check: {r.error_pass or 'unknown'} — {r.error or ''}",
+        )
+        r.numeric = "n/a"
+    else:
+        r.numeric = numeric_check_linear(
+            lin_m, lin_k, lin_n, has_bias=False, build_dir=r.build_dir
+        )
+    results.append(r)
+    print(f"  [e] linear      : compiled={r.compiled} vectorized={r.vectorized} numeric={r.numeric}")
 
     report_path = build_report(results, target_str, args.out_dir)
     print(f"\nReport: {report_path}")

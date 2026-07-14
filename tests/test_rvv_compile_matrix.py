@@ -5,7 +5,7 @@ Times ``lower_to_host_device_ir`` + ``host_codegen`` through ``rvv_target()``
 (riscv64-unknown-elf + ``+zvl``) without writing artifacts.  Full matrix timing
 is available via::
 
-    python demos/matrix_report.py --rvv-compile-quick --out-dir demos/build_rvv
+    python demos/rvv/matrix_report.py --rvv-compile-quick --out-dir demos/build_rvv
 """
 
 import pytest

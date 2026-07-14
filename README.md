@@ -52,7 +52,8 @@ CPU RISC-V Vector lowering for FlashAttention is documented separately:
 - `implementation_plan.md` — current vectorization state and next optimization steps
 
 ```bash
-python demos/run_rvv_lower.py --nr-lanes 4 --mattr +v,+m,+f,+d,+zvl4096b
+python demos/rvv/run_rvv_lower.py --nr-lanes 4
+python demos/rvv/spike_matrix.py --nr-lanes 4
 ```
 
 ## Benchmark

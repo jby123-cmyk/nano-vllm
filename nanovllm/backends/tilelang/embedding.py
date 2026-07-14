@@ -1,22 +1,25 @@
 import os
 
 import torch
+import tilelang
 import tilelang.language as T
 from tilelang import jit
+from tilelang import tvm as tvm
+
+from nanovllm.backends.tilelang.attention import (
+    _ATTENTION_PASS_CONFIGS,
+    tilelang_dtype as _attn_tilelang_dtype,
+)
 
 
 def tilelang_dtype(torch_dtype: torch.dtype) -> str:
-    if torch_dtype == torch.float16:
-        return "float16"
-    if torch_dtype == torch.float32:
-        return "float32"
-    raise ValueError(
-        f"TileLang embedding demo supports float32/float16 weights, got {torch_dtype}. "
-        "Cast weights before calling run_tilelang_embedding()."
-    )
+    return _attn_tilelang_dtype(torch_dtype)
 
 
-@jit
+@jit(
+    out_idx=[2],
+    pass_configs=_ATTENTION_PASS_CONFIGS,
+)
 def build_embedding_kernel(
     num_tokens: int,
     hidden: int,
@@ -31,12 +34,10 @@ def build_embedding_kernel(
         weight: T.Tensor((vocab, hidden), in_dtype),
         out: T.Tensor((num_tokens, hidden), in_dtype),
     ):
-        with T.Kernel(T.ceildiv(num_tokens, token_block), threads=threads) as bx:
-            for ti in T.Parallel(token_block):
-                token_idx = bx * token_block + ti
-                row = input_ids[token_idx]
-                for j in T.serial(hidden):
-                    out[token_idx, j] = weight[row, j]
+        with T.Kernel(num_tokens, threads=threads) as bx:
+            row = input_ids[bx]
+            for j in T.Parallel(hidden):
+                out[bx, j] = weight[row, j]
 
     return embedding_kernel
 
@@ -70,12 +71,28 @@ def dump_tensorir(
     return tir_text
 
 
+def _compile_embedding_kernel(build_args: tuple, backend: str):
+    if backend == "cuda":
+        return build_embedding_kernel(*build_args)
+    if backend == "cpu":
+        with tvm.target.Target("llvm"):
+            return tilelang.compile(
+                build_embedding_kernel.get_tir(*build_args),
+                out_idx=[2],
+                target="llvm",
+                target_host="llvm",
+                execution_backend="tvm_ffi",
+            )
+    raise ValueError(f"backend must be 'cuda' or 'cpu', got {backend!r}.")
+
+
 def run_tilelang_embedding(
     input_ids: torch.Tensor,
     weight: torch.Tensor,
     out: torch.Tensor | None = None,
     token_block: int = 1,
     threads: int = 256,
+    backend: str = "cuda",
 ) -> torch.Tensor:
     if input_ids.dim() != 1:
         raise ValueError(f"input_ids must be 1D, got shape {tuple(input_ids.shape)}")
@@ -84,11 +101,10 @@ def run_tilelang_embedding(
     vocab, hidden = weight.shape
     in_dtype = tilelang_dtype(weight.dtype)
 
-    if out is None:
-        out = torch.empty(num_tokens, hidden, device=weight.device, dtype=weight.dtype)
-
-    kernel = build_embedding_kernel(
-        num_tokens, hidden, vocab, token_block, threads, in_dtype
-    )
-    kernel(input_ids.to(dtype=torch.int32), weight, out)
-    return out
+    build_args = (num_tokens, hidden, vocab, token_block, threads, in_dtype)
+    kernel = _compile_embedding_kernel(build_args, backend)
+    result = kernel(input_ids.to(dtype=torch.int32).contiguous(), weight.contiguous())
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result

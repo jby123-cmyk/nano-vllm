@@ -15,9 +15,9 @@ Run:
 
 Lab-meeting table (max_abs_diff, compile/exec timing, coverage notes)::
 
-    python demos/matrix_report.py --out-dir demos/build_rvv --slide
-    python demos/matrix_report.py --slide-only --out-dir demos/build_rvv
-    python demos/matrix_report.py --rvv-compile-only --out-dir demos/build_rvv
+    python demos/rvv/matrix_report.py --out-dir demos/build_rvv --slide
+    python demos/rvv/matrix_report.py --slide-only --out-dir demos/build_rvv
+    python demos/rvv/matrix_report.py --rvv-compile-only --out-dir demos/build_rvv
 
 The matrix is intentionally diverse but bounded (compilation dominates runtime;
 TileLang caches per shape).  fp32 host tolerance is loose vs the ~1e-6 observed

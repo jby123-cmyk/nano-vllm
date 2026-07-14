@@ -6,6 +6,22 @@ import torch.distributed as dist
 from nanovllm.utils.context import get_context
 
 
+_EMBED_BACKEND = "torch"
+
+
+def set_embed_backend(backend: str) -> None:
+    global _EMBED_BACKEND
+    if backend not in ("torch", "tilelang"):
+        raise ValueError(
+            f"embed_backend must be 'torch' or 'tilelang', got {backend!r}"
+        )
+    _EMBED_BACKEND = backend
+
+
+def get_embed_backend() -> str:
+    return _EMBED_BACKEND
+
+
 class VocabParallelEmbedding(nn.Module):
 
     def __init__(
@@ -35,7 +51,11 @@ class VocabParallelEmbedding(nn.Module):
         if self.tp_size > 1:
             mask = (x >= self.vocab_start_idx) & (x < self.vocab_end_idx)
             x = mask * (x - self.vocab_start_idx)
-        y = F.embedding(x, self.weight)
+        if _EMBED_BACKEND == "tilelang":
+            from nanovllm.backends.tilelang.embedding import run_tilelang_embedding
+            y = run_tilelang_embedding(x.view(-1), self.weight, backend="cuda")
+        else:
+            y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
             dist.all_reduce(y)
@@ -54,11 +74,17 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
+        from nanovllm.layers.linear import get_linear_backend
+
         context = get_context()
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
-        logits = F.linear(x, self.weight)
+        if get_linear_backend() == "tilelang":
+            from nanovllm.backends.tilelang.linear import run_tilelang_linear
+            logits = run_tilelang_linear(x, self.weight, None, backend="cuda")
+        else:
+            logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)

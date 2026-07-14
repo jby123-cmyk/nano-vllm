@@ -10,8 +10,8 @@ head config **16 / 8 / 128** (GQA group 2).  Outputs a presentation-ready CSV.
 
 Usage (nanovllm env)::
 
-    python demos/compile_compare_matrix.py
-    python demos/compile_compare_matrix.py --out-dir demos/build_rvv --nr-lanes 4
+    python demos/rvv/compile_compare_matrix.py
+    python demos/rvv/compile_compare_matrix.py --out-dir demos/build_rvv --nr-lanes 4
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 import torch
 from tilelang import tvm as tvm
 
-# ``demos/`` is on sys.path when invoked as ``python demos/compile_compare_matrix.py``.
+# ``demos/rvv/`` is on sys.path when invoked as ``python demos/rvv/compile_compare_matrix.py``.
 from matrix_report import (  # noqa: E402
     COVERAGE_SHORT,
     DECODE_CONTEXT_LENS,

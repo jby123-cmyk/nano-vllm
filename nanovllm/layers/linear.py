@@ -4,6 +4,25 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 
+# Set from ModelRunner via ``set_linear_backend(config.linear_backend)``.
+# Default preserves existing ``F.linear`` behavior.
+_LINEAR_BACKEND = "torch"
+
+
+def set_linear_backend(backend: str) -> None:
+    """Select linear backend: ``torch`` (default) or ``tilelang``."""
+    global _LINEAR_BACKEND
+    if backend not in ("torch", "tilelang"):
+        raise ValueError(
+            f"linear_backend must be 'torch' or 'tilelang', got {backend!r}"
+        )
+    _LINEAR_BACKEND = backend
+
+
+def get_linear_backend() -> str:
+    return _LINEAR_BACKEND
+
+
 def divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
@@ -30,6 +49,15 @@ class LinearBase(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+    def apply_linear(self, x: torch.Tensor) -> torch.Tensor:
+        """``y = x @ weight.T (+ bias)`` via torch or TileLang."""
+        if _LINEAR_BACKEND == "tilelang":
+            from nanovllm.backends.tilelang.linear import run_tilelang_linear
+            return run_tilelang_linear(
+                x, self.weight, self.bias, backend="cuda"
+            )
+        return F.linear(x, self.weight, self.bias)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
@@ -48,7 +76,7 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return self.apply_linear(x)
 
 
 class ColumnParallelLinear(LinearBase):
@@ -70,7 +98,7 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
+        return self.apply_linear(x)
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -150,7 +178,12 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        bias = self.bias if self.tp_rank == 0 else None
+        if _LINEAR_BACKEND == "tilelang":
+            from nanovllm.backends.tilelang.linear import run_tilelang_linear
+            y = run_tilelang_linear(x, self.weight, bias, backend="cuda")
+        else:
+            y = F.linear(x, self.weight, bias)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y

@@ -18,11 +18,24 @@ for **RISC-V Vector (RVV)**, emitting:
 ```
 
 It is a **cross-compile and validation harness**, not a production inference
-runtime. Host execution uses the same tile-op lowering on x86 `llvm` for numeric
-golden checks; Spike/Verilator execution of `.s` is future work.
+runtime. Host execution uses the same tile-op lowering on x86 `llvm` for a fast
+golden check; Spike executes the RVV `.ll` with the PyTorch golden embedded
+(`demos/rvv/spike_matrix.py`). Verilator remains future work.
 
-The algorithm in `nanovllm/backends/tilelang/attention.py` is **unchanged**
-between CUDA and RVV — only the backend realization differs.
+The algorithm in `nanovllm/backends/tilelang/attention.py` (dense decode /
+prefill) and `nanovllm/backends/tilelang/paged_decode.py` (paged decode matching
+`flash_attn_with_kvcache`) and `nanovllm/backends/tilelang/paged_prefill.py`
+(paged prefill matching `flash_attn_varlen_func` with `block_table`) and
+`nanovllm/backends/tilelang/linear.py` (batched `F.linear` / GEMM with PyTorch
+`weight[out, in]` layout via `transpose_B`) is **unchanged** between CUDA and
+RVV — only the backend realization differs. The linear kernel shares the same
+`GemmVector` → `vfmacc` path as the attention score/context GEMMs. Additional
+per-op kernels (`rmsnorm`, `activation` / SiluAndMul, `rope`, `kv_store`,
+`embedding`) follow the same pattern; a full decoder layer is **composed** from
+these kernels on the host (`DecoderLayerStage`), not lowered as one prim_func. The paged kernel reads the engine's
+`[num_blocks, block_size, num_kv_heads, head_dim]` pool via `block_table`
+indirection; gather/strided loads (`vluxei` / `vlse`) are expected and keep the
+GEMM / softmax loops vectorized.
 
 **Current direction.** The eventual target is a **strided-load-capable** vector
 ISA studied through **instruction-set-level simulation**. Optimization goal:
@@ -315,7 +328,9 @@ Caveats:
    is an attention-specific edge case, so it is left as-is.
 4. **Conservative LMUL** — dynamic `vsetvli` per loop; LLVM backend overhead (`vl1r` spills).
 5. **fp32 baseline** — fp16 needs `zvfh`; GPU tensor-core paths unchanged.
-6. **No Spike/Verilator** — numeric pass is host LLVM, not ISA sim yet.
+6. **Spike ISA-sim** — the RVV matrix can execute on Spike via
+   `demos/rvv/spike_matrix.py` / `nanovllm/backends/spike/` (PyTorch golden
+   embedded in the ELF). Verilator / RTL sim remains future work.
 
 (`vluxei64` on `Q @ K^T` is **no longer listed as a limitation** — it is the
 desired fully-vectorized path on a strided-capable target; see §5/§9. The
@@ -329,8 +344,13 @@ desired fully-vectorized path on a strided-capable target; see §5/§9. The
 | Location | Role |
 |----------|------|
 | `nanovllm/backends/tilelang/attention.py` | FlashAttention kernel source (shared CUDA/RVV) |
+| `nanovllm/backends/tilelang/paged_decode.py` | Paged decode (`flash_attn_with_kvcache` contract) |
+| `nanovllm/backends/tilelang/linear.py` | Batched `F.linear` / GEMM (`weight[out, in]`) |
 | `nanovllm/backends/tilelang/rvv_lower.py` | RVV target + `lower_kernel_rvv()` harness |
-| `demos/run_rvv_lower.py` | Stage 1 ladder + `STAGE1_REPORT.md` |
+| `demos/rvv/run_rvv_lower.py` | Stage 1 ladder + `STAGE1_REPORT.md` |
+| `demos/rvv/matrix_report.py` | Host-proxy numeric + RVV compile matrix |
+| `demos/rvv/spike_matrix.py` | Full matrix → Spike ISA-sim execution |
+| `nanovllm/backends/spike/` | Spike build/run harness (embed PyTorch golden) |
 | `/mnt/ssd/jby123/tilelang/tilelang/transform/serialize_outer_parallel.py` | CPU elementwise-loop vectorization pass (§8) |
 | `/mnt/ssd/jby123/tilelang/tilelang/cpu/pipeline.py` | CPU pass pipeline (registers the pass) |
 | `/mnt/ssd/jby123/tilelang/src/transform/loop_vectorize.cc` | VLEN-aware copy planner |

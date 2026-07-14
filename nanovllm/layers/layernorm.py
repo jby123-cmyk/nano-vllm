@@ -2,6 +2,23 @@ import torch
 from torch import nn
 
 
+# Set from ModelRunner via ``set_norm_backend(config.norm_backend)``.
+_NORM_BACKEND = "torch"
+
+
+def set_norm_backend(backend: str) -> None:
+    global _NORM_BACKEND
+    if backend not in ("torch", "tilelang"):
+        raise ValueError(
+            f"norm_backend must be 'torch' or 'tilelang', got {backend!r}"
+        )
+    _NORM_BACKEND = backend
+
+
+def get_norm_backend() -> str:
+    return _NORM_BACKEND
+
+
 class RMSNorm(nn.Module):
 
     def __init__(
@@ -44,6 +61,11 @@ class RMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if _NORM_BACKEND == "tilelang":
+            from nanovllm.backends.tilelang.rmsnorm import run_tilelang_rmsnorm
+            return run_tilelang_rmsnorm(
+                x, self.weight, residual, eps=self.eps, backend="cuda"
+            )
         if residual is None:
             return self.rms_forward(x)
         else:

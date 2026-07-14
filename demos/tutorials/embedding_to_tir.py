@@ -2,7 +2,7 @@
 Low-level TileLang embedding demo (kernel + TIR dump only).
 
 For engine-integrated comparison (tokenize → embed, ref vs TileLang), use:
-    python demos/compare_tokenize_embed.py
+    python demos/tutorials/compare_tokenize_embed.py
 
 This script remains a minimal compiler tutorial aligned with add_to_tir.py.
 """

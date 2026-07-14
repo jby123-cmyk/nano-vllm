@@ -202,3 +202,8 @@ demos/build/*
 # keep the STAGE1_REPORT.md deliverable tracked.
 demos/build_rvv/*
 !demos/build_rvv/STAGE1_REPORT.md
+!demos/build_rvv/SPIKE_MATRIX_REPORT.md
+!demos/build_rvv/spike_matrix.csv
+
+# Spike matrix per-case ELFs / blobs (regenerable)
+demos/build_rvv/spike/

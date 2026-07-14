@@ -10,16 +10,16 @@ Side-by-side:
   - tilelang:  compiled gather kernel from nanovllm.backends.tilelang
 
 Run:
-  python demos/compare_tokenize_embed.py \\
+  python demos/tutorials/compare_tokenize_embed.py \\
     --random-weights --vocab 512 --hidden 128 \\
     --token-ids 1,2,3,4,5
 
-  python demos/compare_tokenize_embed.py \\
+  python demos/tutorials/compare_tokenize_embed.py \\
     --model ~/huggingface/Qwen3-0.6B/ \\
     --prompt "introduce yourself" \\
     --dump-build
 
-  python demos/compare_tokenize_embed.py \\
+  python demos/tutorials/compare_tokenize_embed.py \\
     --random-weights --vocab 512 --hidden 128 \\
     --token-ids 1,2,3,4,5 \\
     --dump-build demos/build

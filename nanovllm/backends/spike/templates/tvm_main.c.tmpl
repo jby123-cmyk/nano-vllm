@@ -1,0 +1,41 @@
+/* Generated Spike harness — do NOT edit by hand.
+ * case_id: {{CASE_ID}}
+ * phase:   {{PHASE}}
+ */
+#include "tvm_harness.h"
+#include "harness_report.h"
+#include <stdint.h>
+#include <string.h>
+
+extern int __tvm_ffi_main(void *self_handle, TVMArg *args, int num_args, void *result);
+extern void tvm_backend_runtime_init(void);
+extern int printf(const char *fmt, ...);
+extern void tohost_exit(uintptr_t code);
+
+#define GOLDEN_ATOL {{ATOL}}f
+#define COMPARE_ELEMENTS {{COMPARE_ELEMENTS}}
+#define NUM_PACKED_ARGS {{NUM_PACKED_ARGS}}
+
+{{DATA_DECLS}}
+
+uintptr_t handle_trap(uintptr_t cause, uintptr_t epc, uintptr_t regs[32]) {
+  (void)regs;
+  printf("spike trap cause=0x%lx epc=0x%lx\n", (unsigned long)cause, (unsigned long)epc);
+  tohost_exit(1337);
+  return epc;
+}
+
+int main(void) {
+  tvm_backend_runtime_init();
+
+{{TENSOR_SETUP}}
+
+  TVMArg args[NUM_PACKED_ARGS];
+{{ARG_SETUP}}
+
+  int status = __tvm_ffi_main(0, args, NUM_PACKED_ARGS, 0);
+  HarnessCompareStats stats = harness_compare_float(
+      (const float *){{OUTPUT_PTR}}, (const float *){{GOLDEN_PTR}},
+      COMPARE_ELEMENTS, GOLDEN_ATOL);
+  return harness_finish("{{CASE_ID}}", status, stats, COMPARE_ELEMENTS, GOLDEN_ATOL);
+}

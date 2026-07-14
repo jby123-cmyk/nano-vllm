@@ -8,6 +8,12 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.attention import set_attn_backend
+from nanovllm.layers.linear import set_linear_backend
+from nanovllm.layers.layernorm import set_norm_backend
+from nanovllm.layers.activation import set_act_backend
+from nanovllm.layers.rotary_embedding import set_rope_backend
+from nanovllm.layers.embed_head import set_embed_backend
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -23,6 +29,12 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        set_attn_backend(config.attn_backend)
+        set_linear_backend(config.linear_backend)
+        set_norm_backend(config.norm_backend)
+        set_act_backend(config.act_backend)
+        set_rope_backend(config.rope_backend)
+        set_embed_backend(config.embed_backend)
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()

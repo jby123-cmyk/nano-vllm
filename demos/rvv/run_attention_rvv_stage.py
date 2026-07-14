@@ -1,18 +1,18 @@
 """
 Run the attention stage on CPU and compare TileLang (host llvm) vs PyTorch golden.
 
-Mirrors ``demos/run_attention_stage.py`` but uses ``tilelang_backend='cpu'`` so
+Mirrors ``demos/tutorials/run_attention_stage.py`` but uses ``tilelang_backend='cpu'`` so
 the same ``@T.prim_func`` kernels exercised by ``run_rvv_lower.py`` are validated
 against the reference without a CUDA GPU.
 
 Prefill:
 
-  python demos/run_attention_rvv_stage.py \\
+  python demos/rvv/run_attention_rvv_stage.py \\
     --num-heads 8 --num-kv-heads 2 --head-dim 64 --seq-lens 64
 
 Decode:
 
-  python demos/run_attention_rvv_stage.py --decode \\
+  python demos/rvv/run_attention_rvv_stage.py --decode \\
     --num-heads 8 --num-kv-heads 2 --head-dim 64 --context-lens 64,128
 """
 

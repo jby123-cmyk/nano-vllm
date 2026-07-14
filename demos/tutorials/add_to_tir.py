@@ -6,9 +6,9 @@ operation so you can learn the tools first. Once you understand this file,
 swap "vector add" for "embedding lookup" in each section.
 
 Run:
-    python demos/add_to_tir.py
-    python demos/add_to_tir.py --size 4096 --dump-tir demos/add.tir
-    python demos/add_to_tir.py --skip-run   # only print TensorIR, no GPU exec
+    python demos/tutorials/add_to_tir.py
+    python demos/tutorials/add_to_tir.py --size 4096 --dump-tir demos/add.tir
+    python demos/tutorials/add_to_tir.py --skip-run   # only print TensorIR, no GPU exec
 """
 
 import argparse

@@ -18,10 +18,10 @@ Outputs:
 
 Usage (nanovllm env, see usage.md)::
 
-    python demos/matrix_report.py
-    python demos/matrix_report.py --out-dir demos/build_rvv --slide
-    python demos/matrix_report.py --slide-only --out-dir demos/build_rvv
-    python demos/matrix_report.py --rvv-compile-only --slide --nr-lanes 4
+    python demos/rvv/matrix_report.py
+    python demos/rvv/matrix_report.py --out-dir demos/build_rvv --slide
+    python demos/rvv/matrix_report.py --slide-only --out-dir demos/build_rvv
+    python demos/rvv/matrix_report.py --rvv-compile-only --slide --nr-lanes 4
 """
 
 from __future__ import annotations

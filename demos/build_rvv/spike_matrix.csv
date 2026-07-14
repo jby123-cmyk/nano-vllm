@@ -1,0 +1,2 @@
+case_id,phase,num_heads,num_kv_heads,head_dim,lengths,nr_lanes,compiled,host_max_abs_diff,spike_result,spike_max_abs_diff,mismatches,build_ms,run_ms,passed,error
+embedding_len8-64-128_nl4,embedding,1,1,64,"[8, 64, 128]",4,True,0.000000e+00,pass,0.000000e+00,0,640.66,41.45,True,

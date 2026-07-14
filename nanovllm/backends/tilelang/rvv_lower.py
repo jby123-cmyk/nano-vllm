@@ -535,6 +535,75 @@ def numeric_check_matmul(
         return f"fail: {str(exc).strip().splitlines()[-1]}"
 
 
+def numeric_check_linear(
+    num_tokens: int,
+    in_features: int,
+    out_features: int,
+    has_bias: bool = False,
+    block_M: int = 64,
+    block_N: int = 64,
+    block_K: int = 64,
+    build_dir: str | None = None,
+) -> str:
+    """Compare CPU TileLang linear vs ``F.linear`` (fp32)."""
+    import torch.nn.functional as F
+
+    from nanovllm.backends.tilelang.linear import run_tilelang_linear
+
+    demo = "rvv_lower/linear"
+    reference = "torch.nn.functional.linear"
+    backend = "tilelang host llvm + tvm_ffi (backend=cpu)"
+    details = {
+        "num_tokens": num_tokens,
+        "in_features": in_features,
+        "out_features": out_features,
+        "has_bias": has_bias,
+        "dtype": "float32",
+    }
+    try:
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(0)
+        x = torch.randn(num_tokens, in_features, dtype=torch.float32, generator=gen)
+        weight = torch.randn(
+            out_features, in_features, dtype=torch.float32, generator=gen
+        )
+        bias = None
+        if has_bias:
+            bias = torch.randn(out_features, dtype=torch.float32, generator=gen)
+        expected = F.linear(x, weight, bias)
+        out = run_tilelang_linear(
+            x,
+            weight,
+            bias,
+            backend="cpu",
+            block_M=block_M,
+            block_N=block_N,
+            block_K=block_K,
+        )
+        if build_dir:
+            _, passed = compare_and_log(
+                build_dir,
+                demo=demo,
+                reference=reference,
+                backend=backend,
+                tilelang_tensor=out,
+                reference_tensor=expected,
+                atol=1e-2,
+                rtol=1e-2,
+                details=details,
+                raise_on_fail=False,
+            )
+            return "pass" if passed else "fail: see golden.log"
+        torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+        return "pass"
+    except Exception as exc:  # noqa: BLE001
+        if build_dir:
+            log_numeric_exception(
+                build_dir, demo=demo, reference=reference, backend=backend, exc=exc, details=details
+            )
+        return f"fail: {str(exc).strip().splitlines()[-1]}"
+
+
 def _attention_numeric_check(
     phase: str,
     lengths: list[int],

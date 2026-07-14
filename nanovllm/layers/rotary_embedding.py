@@ -3,6 +3,22 @@ import torch
 from torch import nn
 
 
+_ROPE_BACKEND = "torch"
+
+
+def set_rope_backend(backend: str) -> None:
+    global _ROPE_BACKEND
+    if backend not in ("torch", "tilelang"):
+        raise ValueError(
+            f"rope_backend must be 'torch' or 'tilelang', got {backend!r}"
+        )
+    _ROPE_BACKEND = backend
+
+
+def get_rope_backend() -> str:
+    return _ROPE_BACKEND
+
+
 def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -35,7 +51,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     @torch.compile
-    def forward(
+    def _torch_forward(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -46,6 +62,19 @@ class RotaryEmbedding(nn.Module):
         query = apply_rotary_emb(query, cos, sin)
         key = apply_rotary_emb(key, cos, sin)
         return query, key
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if _ROPE_BACKEND == "tilelang":
+            from nanovllm.backends.tilelang.rope import run_tilelang_rope
+            cos_sin = self.cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            return run_tilelang_rope(query, key, cos, sin, backend="cuda")
+        return self._torch_forward(positions, query, key)
 
 
 @lru_cache(1)
