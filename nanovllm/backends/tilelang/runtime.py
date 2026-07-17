@@ -152,10 +152,13 @@ def compile_tilelang_kernel(
     tir_func = builder.get_tir(*build_args)
     compile_out_idx = None if out_idx is None else ([out_idx] if isinstance(out_idx, int) else list(out_idx))
     if backend == "cpu":
-        with tvm.target.Target("llvm"):
+        _cpu_native_target = tvm.target.Target(
+            {"kind": "llvm", "mtriple": "riscv64-linux-gnu", "mabi": "lp64d", "mattr": ["+f", "+d"]}
+        )
+        with _cpu_native_target:
             kwargs = {
-                "target": "llvm",
-                "target_host": "llvm",
+                "target": _cpu_native_target,
+                "target_host": _cpu_native_target,
                 "execution_backend": "tvm_ffi",
             }
             if compile_out_idx is not None:
@@ -357,10 +360,13 @@ class _RvvKernelHandle:
     def _cpu_reference(self) -> Callable:
         if self._cpu_reference_callable is None:
             compile_out_idx = self._out_idx
-            with tvm.target.Target("llvm"):
+            _cpu_native_target = tvm.target.Target(
+                {"kind": "llvm", "mtriple": "riscv64-linux-gnu", "mabi": "lp64d", "mattr": ["+f", "+d"]}
+            )
+            with _cpu_native_target:
                 kwargs = {
-                    "target": "llvm",
-                    "target_host": "llvm",
+                    "target": _cpu_native_target,
+                    "target_host": _cpu_native_target,
                     "execution_backend": "tvm_ffi",
                 }
                 if compile_out_idx is not None:
