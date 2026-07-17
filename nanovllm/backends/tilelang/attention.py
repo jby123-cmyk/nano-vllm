@@ -421,29 +421,25 @@ def build_flash_attention_decode_kernel(
 # --------------------------------------------------------------------------- #
 # Run helpers (compile + execute)
 # --------------------------------------------------------------------------- #
-# Both attention kernels run on two backends from the *same* @T.prim_func:
-#
-#   backend="cuda" — JIT-compile/execute on the default CUDA target (engine op).
-#   backend="cpu"  — host ``llvm`` + ``tvm_ffi`` (RVV numeric-validation path).
-#                    The riscv64 RVV artifacts are not host-runnable, so kernel
-#                    correctness is gated on the *identical* CPU tile-op lowering
-#                    (fragment layouts, GemmVector, CPU reduce, skipped software
-#                    pipeline, tl.infinity) that the .s artifacts are retargeted
-#                    from.  Bit-exact RVV execution needs Spike/Verilator.
-def _compile_attention_kernel(builder, build_args: tuple, out_idx: int, backend: str):
+from nanovllm.backends.tilelang.runtime import compile_tilelang_kernel
+
+
+def _compile_attention_kernel(
+    builder,
+    build_args: tuple,
+    out_idx: int,
+    backend: str,
+    *,
+    kernel_name: str | None = None,
+):
     """Compile ``builder`` for ``backend`` and return a callable kernel."""
-    if backend == "cuda":
-        return builder(*build_args)
-    if backend == "cpu":
-        with tvm.target.Target("llvm"):
-            return tilelang.compile(
-                builder.get_tir(*build_args),
-                out_idx=[out_idx],
-                target="llvm",
-                target_host="llvm",
-                execution_backend="tvm_ffi",
-            )
-    raise ValueError(f"backend must be 'cuda' or 'cpu', got {backend!r}.")
+    return compile_tilelang_kernel(
+        builder,
+        build_args,
+        out_idx,
+        backend,
+        kernel_name=kernel_name or getattr(builder, "__name__", "attention"),
+    )
 
 
 def run_tilelang_attention_prefill(
@@ -502,9 +498,11 @@ def run_tilelang_attention_prefill(
     build_args = (
         batch_size, padded_q, padded_kv, num_heads, num_kv_heads, head_dim,
         float(softmax_scale), is_causal, block_M, block_N, num_stages, threads, in_dtype,
-        backend == "cpu",
+        backend != "cuda",
     )
-    kernel = _compile_attention_kernel(build_flash_attention_prefill_kernel, build_args, 6, backend)
+    kernel = _compile_attention_kernel(
+        build_flash_attention_prefill_kernel, build_args, 6, backend, kernel_name="prefill"
+    )
     out = kernel(
         q_pad.contiguous(),
         k_pad.contiguous(),
@@ -556,9 +554,11 @@ def run_tilelang_attention_decode(
     build_args = (
         batch_size, seqlen_kv, num_heads, num_kv_heads, head_dim,
         float(softmax_scale), block_N, block_H, num_stages, threads, in_dtype,
-        backend == "cpu",
+        backend != "cuda",
     )
-    kernel = _compile_attention_kernel(build_flash_attention_decode_kernel, build_args, 4, backend)
+    kernel = _compile_attention_kernel(
+        build_flash_attention_decode_kernel, build_args, 4, backend, kernel_name="decode"
+    )
     return kernel(
         q.contiguous(),
         k_cache.contiguous(),

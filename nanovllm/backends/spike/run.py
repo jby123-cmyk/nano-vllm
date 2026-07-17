@@ -33,6 +33,27 @@ _SUMMARY_RE = re.compile(
     re.M,
 )
 
+_EXECUTE_SUMMARY_RE = re.compile(
+    r"^HARNESS_EXECUTE_SUMMARY\s+"
+    r"app=(?P<app>\S+)\s+"
+    r"kernel_status=(?P<kernel_status>-?\d+)\s+"
+    r"spike_result=(?P<spike_result>\S+)\s+"
+    r"num_outputs=(?P<num_outputs>\d+)",
+    re.M,
+)
+
+_OUTPUT_BEGIN_RE = re.compile(
+    r"^OUTPUT_BEGIN name=(?P<name>\S+) dtype=(?P<dtype>\S+) nbytes=(?P<nbytes>\d+)",
+    re.M,
+)
+
+_OUTPUT_CHUNK_RE = re.compile(
+    r"^OUTPUT_CHUNK offset=(?P<offset>\d+) nbytes=(?P<nbytes>\d+) hex=(?P<hex>[0-9a-fA-F]*)",
+    re.M,
+)
+
+_OUTPUT_END_RE = re.compile(r"^OUTPUT_END name=(?P<name>\S+)", re.M)
+
 
 def _bits_to_float(bits_hex: str) -> float:
     bits = int(bits_hex, 16)
@@ -56,6 +77,136 @@ class SpikeResult:
     @property
     def passed(self) -> bool:
         return self.returncode == 0 and self.spike_result == "pass"
+
+
+@dataclass
+class SpikeExecuteResult:
+    app: str
+    elf_path: str
+    returncode: int
+    spike_result: str
+    kernel_status: int
+    num_outputs: int
+    output_bytes: dict[str, bytes]
+    run_ms: float
+    stdout: str
+
+    @property
+    def passed(self) -> bool:
+        return self.returncode == 0 and self.spike_result == "pass"
+
+
+def parse_execute_outputs(stdout: str) -> dict[str, bytes]:
+    """Parse OUTPUT_* blocks emitted by ``harness_finish_execute``."""
+    outputs: dict[str, bytearray] = {}
+    current: str | None = None
+    expected = 0
+    for line in stdout.splitlines():
+        begin = _OUTPUT_BEGIN_RE.match(line)
+        if begin:
+            current = begin.group("name")
+            expected = int(begin.group("nbytes"))
+            outputs[current] = bytearray(expected)
+            continue
+        chunk = _OUTPUT_CHUNK_RE.match(line)
+        if chunk and current is not None:
+            offset = int(chunk.group("offset"))
+            nbytes = int(chunk.group("nbytes"))
+            raw = bytes.fromhex(chunk.group("hex") or "")
+            if len(raw) != nbytes:
+                raise ValueError(
+                    f"{current}: chunk nbytes={nbytes} but hex decoded {len(raw)}"
+                )
+            buf = outputs[current]
+            buf[offset : offset + nbytes] = raw
+            continue
+        end = _OUTPUT_END_RE.match(line)
+        if end and current is not None:
+            if end.group("name") != current:
+                raise ValueError(
+                    f"OUTPUT_END name mismatch: {end.group('name')} != {current}"
+                )
+            if len(outputs[current]) != expected:
+                raise ValueError(
+                    f"{current}: expected {expected} bytes, got {len(outputs[current])}"
+                )
+            current = None
+    return {name: bytes(data) for name, data in outputs.items()}
+
+
+def parse_execute_summary(stdout: str) -> dict | None:
+    matches = list(_EXECUTE_SUMMARY_RE.finditer(stdout))
+    if not matches:
+        return None
+    m = matches[-1]
+    return {
+        "app": m.group("app"),
+        "kernel_status": int(m.group("kernel_status")),
+        "spike_result": m.group("spike_result"),
+        "num_outputs": int(m.group("num_outputs")),
+    }
+
+
+def run_spike_execute_elf(
+    elf_path: str,
+    *,
+    cfg: SpikeConfig | None = None,
+    timeout_s: float | None = 600.0,
+) -> SpikeExecuteResult:
+    cfg = cfg or default_config()
+    cfg.assert_available()
+    if not os.path.isfile(elf_path):
+        raise FileNotFoundError(elf_path)
+
+    argv = cfg.spike_argv(elf_path)
+    t0 = time.perf_counter()
+    proc = subprocess.run(
+        argv,
+        text=True,
+        capture_output=True,
+        timeout=timeout_s,
+        check=False,
+    )
+    run_ms = (time.perf_counter() - t0) * 1000.0
+    stdout = (proc.stdout or "") + (proc.stderr or "")
+    parsed = parse_execute_summary(stdout)
+    if parsed is None:
+        return SpikeExecuteResult(
+            app=os.path.basename(elf_path),
+            elf_path=elf_path,
+            returncode=proc.returncode,
+            spike_result="no_summary",
+            kernel_status=-1,
+            num_outputs=0,
+            output_bytes={},
+            run_ms=run_ms,
+            stdout=stdout,
+        )
+    try:
+        output_bytes = parse_execute_outputs(stdout)
+    except ValueError as exc:
+        return SpikeExecuteResult(
+            app=parsed["app"],
+            elf_path=elf_path,
+            returncode=proc.returncode,
+            spike_result="output_parse_error",
+            kernel_status=parsed["kernel_status"],
+            num_outputs=parsed["num_outputs"],
+            output_bytes={},
+            run_ms=run_ms,
+            stdout=stdout + f"\noutput_parse_error: {exc}\n",
+        )
+    return SpikeExecuteResult(
+        app=parsed["app"],
+        elf_path=elf_path,
+        returncode=proc.returncode,
+        spike_result=parsed["spike_result"],
+        kernel_status=parsed["kernel_status"],
+        num_outputs=parsed["num_outputs"],
+        output_bytes=output_bytes,
+        run_ms=run_ms,
+        stdout=stdout,
+    )
 
 
 def parse_harness_summary(stdout: str) -> dict | None:

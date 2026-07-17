@@ -58,3 +58,48 @@ int harness_finish(const char *app, int kernel_status, HarnessCompareStats stats
 
   return (stats.mismatches == 0) ? 0 : 1;
 }
+
+static void harness_dump_output_hex(const HarnessOutputSpec *output) {
+  const unsigned char *data = output->data;
+  int nbytes = output->nbytes;
+  const int chunk = 256;
+  printf(
+      "OUTPUT_BEGIN name=%s dtype=%s nbytes=%d\n",
+      output->name,
+      output->dtype_tag,
+      nbytes);
+  for (int off = 0; off < nbytes; off += chunk) {
+    int n = nbytes - off;
+    if (n > chunk) {
+      n = chunk;
+    }
+    printf("OUTPUT_CHUNK offset=%d nbytes=%d hex=", off, n);
+    for (int i = 0; i < n; ++i) {
+      printf("%02x", data[off + i]);
+    }
+    printf("\n");
+  }
+  printf("OUTPUT_END name=%s\n", output->name);
+}
+
+int harness_finish_execute(
+    const char *app, int kernel_status, const HarnessOutputSpec *outputs, int num_outputs) {
+  if (kernel_status != 0) {
+    printf(
+        "HARNESS_EXECUTE_SUMMARY app=%s kernel_status=%d spike_result=kernel_error "
+        "num_outputs=%d\n",
+        app,
+        kernel_status,
+        num_outputs);
+    return 10 + kernel_status;
+  }
+
+  printf(
+      "HARNESS_EXECUTE_SUMMARY app=%s kernel_status=0 spike_result=pass num_outputs=%d\n",
+      app,
+      num_outputs);
+  for (int i = 0; i < num_outputs; ++i) {
+    harness_dump_output_hex(&outputs[i]);
+  }
+  return 0;
+}

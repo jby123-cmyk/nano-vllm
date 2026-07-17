@@ -2,6 +2,8 @@ from functools import lru_cache
 import torch
 from torch import nn
 
+from nanovllm.backends.tilelang.runtime import get_tilelang_execution_backend
+
 
 _ROPE_BACKEND = "torch"
 
@@ -73,7 +75,7 @@ class RotaryEmbedding(nn.Module):
             from nanovllm.backends.tilelang.rope import run_tilelang_rope
             cos_sin = self.cos_sin_cache[positions]
             cos, sin = cos_sin.chunk(2, dim=-1)
-            return run_tilelang_rope(query, key, cos, sin, backend="cuda")
+            return run_tilelang_rope(query, key, cos, sin, backend=get_tilelang_execution_backend())
         return self._torch_forward(positions, query, key)
 
 

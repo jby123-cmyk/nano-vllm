@@ -120,4 +120,4 @@ def test_invalid_backend_rejected():
     v = torch.randn(1, 128, 2, 64)
     mask = torch.ones(1, 128, 2, dtype=torch.uint8)
     with pytest.raises(ValueError):
-        run_tilelang_attention_decode(q, k, v, mask, softmax_scale=0.125, backend="rvv")
+        run_tilelang_attention_decode(q, k, v, mask, softmax_scale=0.125, backend="bogus")

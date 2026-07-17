@@ -61,18 +61,17 @@ def build_kv_store_kernel(
     return main
 
 
+from nanovllm.backends.tilelang.runtime import compile_tilelang_kernel, get_tilelang_execution_backend
+
+
 def _compile_kv_store_kernel(build_args: tuple, backend: str):
-    if backend == "cuda":
-        return build_kv_store_kernel(*build_args)
-    if backend == "cpu":
-        with tvm.target.Target("llvm"):
-            return tilelang.compile(
-                build_kv_store_kernel.get_tir(*build_args),
-                target="llvm",
-                target_host="llvm",
-                execution_backend="tvm_ffi",
-            )
-    raise ValueError(f"backend must be 'cuda' or 'cpu', got {backend!r}.")
+    return compile_tilelang_kernel(
+        build_kv_store_kernel,
+        build_args,
+        None,
+        backend,
+        kernel_name="kv_store",
+    )
 
 
 def run_tilelang_store_kvcache(
@@ -105,10 +104,18 @@ def run_tilelang_store_kvcache(
         in_dtype,
     )
     kernel = _compile_kv_store_kernel(build_args, backend)
-    kernel(
+    result = kernel(
         key.contiguous(),
         value.contiguous(),
         k_flat,
         v_flat,
         slot_mapping.to(torch.int32).contiguous(),
     )
+    if get_tilelang_execution_backend() == "rvv" and isinstance(result, tuple):
+        k_out, v_out = result
+        sm = slot_mapping.to(torch.int32)
+        for i in range(num_tokens):
+            slot = int(sm[i].item())
+            if slot >= 0:
+                k_flat[slot].copy_(k_out[slot].to(device=k_flat.device, dtype=k_flat.dtype))
+                v_flat[slot].copy_(v_out[slot].to(device=v_flat.device, dtype=v_flat.dtype))

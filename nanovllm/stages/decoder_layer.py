@@ -100,13 +100,15 @@ class DecoderLayerStage:
         sin = randn(batch_size, 1, half)
 
         # Dense KV cache context (padded); last position held for "current" K/V.
+        # AttentionStage only builds dense KV fixtures / PyTorch references here.
+        attn_backend = "cpu" if self.tilelang_backend == "rvv" else self.tilelang_backend
         stage = AttentionStage(
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             dtype=self.dtype,
             device=self.device,
-            tilelang_backend=self.tilelang_backend,
+            tilelang_backend=attn_backend,
             seed=self.seed + 1,
             decode_block_N=self.decode_block_N,
             decode_block_H=max(1, self.num_heads // self.num_kv_heads),

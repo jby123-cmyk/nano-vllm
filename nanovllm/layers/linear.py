@@ -3,6 +3,8 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from nanovllm.backends.tilelang.runtime import get_tilelang_execution_backend
+
 
 # Set from ModelRunner via ``set_linear_backend(config.linear_backend)``.
 # Default preserves existing ``F.linear`` behavior.
@@ -54,7 +56,7 @@ class LinearBase(nn.Module):
         if _LINEAR_BACKEND == "tilelang":
             from nanovllm.backends.tilelang.linear import run_tilelang_linear
             return run_tilelang_linear(
-                x, self.weight, self.bias, backend="cuda"
+                x, self.weight, self.bias, backend=get_tilelang_execution_backend()
             )
         return F.linear(x, self.weight, self.bias)
 
@@ -181,7 +183,7 @@ class RowParallelLinear(LinearBase):
         bias = self.bias if self.tp_rank == 0 else None
         if _LINEAR_BACKEND == "tilelang":
             from nanovllm.backends.tilelang.linear import run_tilelang_linear
-            y = run_tilelang_linear(x, self.weight, bias, backend="cuda")
+            y = run_tilelang_linear(x, self.weight, bias, backend=get_tilelang_execution_backend())
         else:
             y = F.linear(x, self.weight, bias)
         if self.tp_size > 1:

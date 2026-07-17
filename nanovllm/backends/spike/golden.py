@@ -78,6 +78,9 @@ def _write_blob(path: str, tensor: torch.Tensor) -> int:
     return int(arr.numel())
 
 
+write_tensor_blob = _write_blob
+
+
 def _tensor_entry(
     name: str,
     dtype: str,
@@ -103,6 +106,9 @@ def _tensor_entry(
     }
 
 
+make_tensor_entry = _tensor_entry
+
+
 def _scalar_entry(name: str, value: int) -> dict[str, Any]:
     return {
         "name": name,
@@ -111,6 +117,9 @@ def _scalar_entry(name: str, value: int) -> dict[str, Any]:
         "role": "scalar",
         "kind": "scalar",
     }
+
+
+scalar_entry = _scalar_entry
 
 
 def emit_golden(
@@ -386,6 +395,164 @@ def emit_golden(
             case_dir=case_dir,
             manifest_path=manifest_path,
             manifest=manifest,
+        )
+
+    if phase == "rope":
+        from nanovllm.layers.rotary_embedding import apply_rotary_emb
+
+        tokens, num_heads, num_kv_heads, head_dim = lengths
+        half = head_dim // 2
+        block_M = 64
+        padded_m = _round_up(max(tokens, 1), block_M)
+
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(0)
+        q = torch.randn(tokens, num_heads, head_dim, dtype=torch.float32, generator=gen)
+        k = torch.randn(
+            tokens, num_kv_heads, head_dim, dtype=torch.float32, generator=gen
+        )
+        cos = torch.randn(tokens, 1, half, dtype=torch.float32, generator=gen)
+        sin = torch.randn(tokens, 1, half, dtype=torch.float32, generator=gen)
+
+        q_ref = apply_rotary_emb(q, cos, sin)
+        k_ref = apply_rotary_emb(k, cos, sin)
+
+        q_pad = q
+        k_pad = k
+        cos_pad = cos
+        sin_pad = sin
+        if padded_m != tokens:
+            q_pad = torch.zeros(padded_m, num_heads, head_dim, dtype=torch.float32)
+            k_pad = torch.zeros(padded_m, num_kv_heads, head_dim, dtype=torch.float32)
+            cos_pad = torch.zeros(padded_m, 1, half, dtype=torch.float32)
+            sin_pad = torch.zeros(padded_m, 1, half, dtype=torch.float32)
+            q_pad[:tokens] = q
+            k_pad[:tokens] = k
+            cos_pad[:tokens] = cos
+            sin_pad[:tokens] = sin
+
+        q_out = torch.zeros_like(q_pad)
+        k_out = torch.zeros_like(k_pad)
+        golden_q = torch.zeros_like(q_pad)
+        golden_q[:tokens] = q_ref
+        golden_k = torch.zeros_like(k_pad)
+        golden_k[:tokens] = k_ref
+
+        for name, tensor, dtype, role in [
+            ("q", q_pad, "f32", "input"),
+            ("k", k_pad, "f32", "input"),
+            ("cos", cos_pad, "f32", "input"),
+            ("sin", sin_pad, "f32", "input"),
+            ("q_out", q_out, "f32", "output"),
+            ("k_out", k_out, "f32", "output"),
+            ("golden", golden_q, "f32", "golden"),
+        ]:
+            blob = f"blobs/{name}.bin"
+            _write_blob(os.path.join(case_dir, blob), tensor)
+            args.append(_tensor_entry(name, dtype, list(tensor.shape), blob, role=role))
+
+        meta = {
+            "num_tokens": tokens,
+            "padded_m": padded_m,
+            "num_heads": num_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "block_M": block_M,
+            "compare_k_elements": int(k_ref.numel()),
+        }
+        numel_out = int(q_ref.numel())
+        manifest = {
+            "case_id": case_id,
+            "phase": phase,
+            "num_heads": num_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "lengths": list(lengths),
+            "nr_lanes": nr_lanes,
+            "atol": float(atol),
+            "softmax_scale": 1.0,
+            "seed": 0,
+            "compare_elements": numel_out,
+            "meta": meta,
+            "args": args,
+        }
+        manifest_path = os.path.join(case_dir, "manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        return GoldenCase(
+            case_id=case_id, phase=phase, case_dir=case_dir,
+            manifest_path=manifest_path, manifest=manifest,
+        )
+
+    if phase == "kv_store":
+        tokens, num_kv_heads, head_dim, num_slots = lengths
+        D = num_kv_heads * head_dim
+
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(0)
+        key = torch.randn(tokens, num_kv_heads, head_dim, dtype=torch.float32, generator=gen)
+        value = torch.randn(tokens, num_kv_heads, head_dim, dtype=torch.float32, generator=gen)
+        k_cache = torch.randn(num_slots, D, dtype=torch.float32, generator=gen)
+        v_cache = torch.randn(num_slots, D, dtype=torch.float32, generator=gen)
+        slot_mapping = torch.tensor(
+            [i * 3 % num_slots if i % 3 != 2 else -1 for i in range(tokens)],
+            dtype=torch.int32,
+        )
+
+        golden_k = k_cache.clone()
+        golden_v = v_cache.clone()
+        for i in range(tokens):
+            slot = int(slot_mapping[i].item())
+            if slot >= 0:
+                golden_k[slot] = key[i].reshape(-1)
+                golden_v[slot] = value[i].reshape(-1)
+
+        for name, tensor, dtype, role in [
+            ("key", key, "f32", "input"),
+            ("value", value, "f32", "input"),
+            ("k_cache", k_cache, "f32", "input"),
+            ("v_cache", v_cache, "f32", "input"),
+            ("slot_mapping", slot_mapping, "int32", "input"),
+            ("golden", golden_k, "f32", "golden"),
+        ]:
+            blob = f"blobs/{name}.bin"
+            _write_blob(os.path.join(case_dir, blob), tensor)
+            args.append(_tensor_entry(name, dtype, list(tensor.shape), blob, role=role))
+
+        meta = {
+            "num_tokens": tokens,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "num_slots": num_slots,
+            "D": D,
+            "compare_v_elements": int(golden_v.numel()),
+        }
+        numel_out = int(golden_k.numel())
+        manifest = {
+            "case_id": case_id,
+            "phase": phase,
+            "num_heads": num_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "lengths": list(lengths),
+            "nr_lanes": nr_lanes,
+            "atol": float(atol),
+            "softmax_scale": 1.0,
+            "seed": 0,
+            "compare_elements": numel_out,
+            "compare_tensor": "k_cache",
+            "meta": meta,
+            "args": args,
+        }
+        manifest_path = os.path.join(case_dir, "manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        _write_blob(os.path.join(case_dir, "blobs/golden_v.bin"), golden_v)
+        return GoldenCase(
+            case_id=case_id, phase=phase, case_dir=case_dir,
+            manifest_path=manifest_path, manifest=manifest,
         )
 
     stage = _rvv_stage(num_heads, num_kv_heads, head_dim, nr_lanes)
@@ -835,6 +1002,66 @@ def host_sanity_check(golden: GoldenCase) -> float:
         return float(
             (out[:mt, :nt].float() - golden_t[:mt, :nt].float()).abs().max().item()
         )
+
+    if golden.phase == "rope":
+        from nanovllm.backends.tilelang.rope import _compile_rope_kernel
+
+        by_name = {a["name"]: a for a in m["args"]}
+        q = load("q", torch.float32, by_name["q"]["shape"])
+        k = load("k", torch.float32, by_name["k"]["shape"])
+        cos = load("cos", torch.float32, by_name["cos"]["shape"])
+        sin = load("sin", torch.float32, by_name["sin"]["shape"])
+        golden_q = load("golden", torch.float32, by_name["golden"]["shape"])
+        meta = m["meta"]
+        tokens = meta["num_tokens"]
+        build_args = (
+            meta["padded_m"],
+            meta["num_heads"],
+            meta["num_kv_heads"],
+            meta["head_dim"],
+            meta["block_M"],
+            128,
+            "float32",
+        )
+        kernel = _compile_rope_kernel(build_args, "cpu")
+        q_out, k_out = kernel(q, k, cos, sin)
+        diff_q = float((q_out[:tokens].float() - golden_q[:tokens].float()).abs().max().item())
+        # k_out checked against PyTorch golden recomputed from blobs.
+        k_blob = load("k", torch.float32, by_name["k"]["shape"])
+        from nanovllm.layers.rotary_embedding import apply_rotary_emb
+
+        k_ref = apply_rotary_emb(k_blob[:tokens], cos[:tokens], sin[:tokens])
+        diff_k = float((k_out[:tokens].float() - k_ref.float()).abs().max().item())
+        return max(diff_q, diff_k)
+
+    if golden.phase == "kv_store":
+        from nanovllm.backends.tilelang.kv_store import _compile_kv_store_kernel
+
+        by_name = {a["name"]: a for a in m["args"]}
+        key = load("key", torch.float32, by_name["key"]["shape"])
+        value = load("value", torch.float32, by_name["value"]["shape"])
+        k_cache = load("k_cache", torch.float32, by_name["k_cache"]["shape"])
+        v_cache = load("v_cache", torch.float32, by_name["v_cache"]["shape"])
+        slot_mapping = load("slot_mapping", torch.int32, by_name["slot_mapping"]["shape"])
+        golden_k = load("golden", torch.float32, by_name["golden"]["shape"])
+        with open(os.path.join(blob_dir, "blobs/golden_v.bin"), "rb") as handle:
+            golden_v = torch.frombuffer(
+                bytearray(handle.read()), dtype=torch.float32
+            ).reshape(by_name["v_cache"]["shape"]).clone()
+        meta = m["meta"]
+        build_args = (
+            meta["num_tokens"],
+            meta["num_kv_heads"],
+            meta["head_dim"],
+            meta["num_slots"],
+            128,
+            "float32",
+        )
+        kernel = _compile_kv_store_kernel(build_args, "cpu")
+        kernel(key, value, k_cache, v_cache, slot_mapping)
+        diff_k = float((k_cache.float() - golden_k.float()).abs().max().item())
+        diff_v = float((v_cache.float() - golden_v.float()).abs().max().item())
+        return max(diff_k, diff_v)
 
     if golden.phase == "prefill_paged":
         from nanovllm.backends.tilelang.paged_prefill import (

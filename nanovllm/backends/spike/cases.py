@@ -60,6 +60,12 @@ SILU_SHAPES = [
 EMBED_SHAPES = [
     ([8, 64, 128], "embedding gather"),
 ]
+ROPE_SHAPES = [
+    ([8, 4, 2, 64], "decode-step RoPE (tokens, heads, kv_heads, head_dim)"),
+]
+KV_STORE_SHAPES = [
+    ([8, 2, 64, 512], "paged KV scatter (tokens, kv_heads, head_dim, num_slots)"),
+]
 
 
 @dataclass(frozen=True)
@@ -166,5 +172,9 @@ def enumerate_cases(
             _add("silu_mul", lengths, note, 1, 1, 64)
         for lengths, note in EMBED_SHAPES:
             _add("embedding", lengths, note, 1, 1, 64)
+        for lengths, note in ROPE_SHAPES:
+            _add("rope", lengths, note, lengths[1], lengths[2], lengths[3])
+        for lengths, note in KV_STORE_SHAPES:
+            _add("kv_store", lengths, note, lengths[1], lengths[1], lengths[2])
 
     return cases

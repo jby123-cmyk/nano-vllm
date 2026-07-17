@@ -132,3 +132,33 @@ def test_spike_rmsnorm_small():
     )
     assert result.passed, result.error or result.spike_result
     assert result.spike_max_abs_diff <= 1e-2
+
+
+@pytest.mark.slow
+def test_spike_rope_small():
+    result = run_case(
+        "rope",
+        [8, 4, 2, 64],
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=64,
+        nr_lanes=4,
+        skip_host_sanity=True,
+    )
+    assert result.passed, result.error or result.spike_result
+    assert result.spike_max_abs_diff <= 1e-2
+
+
+@pytest.mark.slow
+def test_spike_kv_store_small():
+    result = run_case(
+        "kv_store",
+        [8, 2, 64, 512],
+        num_heads=2,
+        num_kv_heads=2,
+        head_dim=64,
+        nr_lanes=4,
+        skip_host_sanity=True,
+    )
+    assert result.passed, result.error or result.spike_result
+    assert result.spike_max_abs_diff <= 1e-2

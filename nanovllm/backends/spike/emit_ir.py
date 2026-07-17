@@ -102,7 +102,9 @@ def build_attention_tir(
 
         # lengths = [tokens, heads, kv_heads, head_dim]
         tokens, nh, nkv, hd = lengths
-        build_args = (tokens, nh, nkv, hd, 64, 128, "float32")
+        block_M = 64
+        padded_m = _round_up(max(tokens, 1), block_M)
+        build_args = (padded_m, nh, nkv, hd, block_M, 128, "float32")
         tir = build_rope_kernel.get_tir(*build_args)
         return tir, ("rope",) + build_args
 

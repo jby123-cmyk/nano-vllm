@@ -1,6 +1,7 @@
 /* Generated Spike harness — do NOT edit by hand.
  * case_id: {{CASE_ID}}
  * phase:   {{PHASE}}
+ * mode:    {{MODE}}
  */
 #include "tvm_harness.h"
 #include "harness_report.h"
@@ -12,9 +13,9 @@ extern void tvm_backend_runtime_init(void);
 extern int printf(const char *fmt, ...);
 extern void tohost_exit(uintptr_t code);
 
-#define GOLDEN_ATOL {{ATOL}}f
-#define COMPARE_ELEMENTS {{COMPARE_ELEMENTS}}
 #define NUM_PACKED_ARGS {{NUM_PACKED_ARGS}}
+
+{{VALIDATE_DEFINES}}
 
 {{DATA_DECLS}}
 
@@ -34,8 +35,5 @@ int main(void) {
 {{ARG_SETUP}}
 
   int status = __tvm_ffi_main(0, args, NUM_PACKED_ARGS, 0);
-  HarnessCompareStats stats = harness_compare_float(
-      (const float *){{OUTPUT_PTR}}, (const float *){{GOLDEN_PTR}},
-      COMPARE_ELEMENTS, GOLDEN_ATOL);
-  return harness_finish("{{CASE_ID}}", status, stats, COMPARE_ELEMENTS, GOLDEN_ATOL);
+{{POST_KERNEL_BODY}}
 }

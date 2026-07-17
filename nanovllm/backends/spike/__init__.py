@@ -9,7 +9,19 @@ See ``spike_integration_plan.md`` and ``usage.md``.
 
 from nanovllm.backends.spike.config import SpikeConfig, default_config
 from nanovllm.backends.spike.pipeline import CaseResult, run_case
-from nanovllm.backends.spike.run import SpikeResult, run_spike_elf, smoke_matmul
+from nanovllm.backends.spike.run import (
+    SpikeExecuteResult,
+    SpikeResult,
+    run_spike_elf,
+    run_spike_execute_elf,
+    smoke_matmul,
+)
+from nanovllm.backends.spike.session import (
+    SpikeKernelSession,
+    configure_spike_session,
+    get_spike_session,
+    reset_spike_session,
+)
 
 __all__ = [
     "SpikeConfig",
@@ -17,6 +29,12 @@ __all__ = [
     "run_case",
     "CaseResult",
     "run_spike_elf",
+    "run_spike_execute_elf",
     "SpikeResult",
+    "SpikeExecuteResult",
+    "SpikeKernelSession",
+    "configure_spike_session",
+    "get_spike_session",
+    "reset_spike_session",
     "smoke_matmul",
 ]

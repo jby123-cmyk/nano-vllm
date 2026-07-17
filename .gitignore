@@ -207,3 +207,13 @@ demos/build_rvv/*
 
 # Spike matrix per-case ELFs / blobs (regenerable)
 demos/build_rvv/spike/
+
+# Generated tiny-model weights (config + meta are tracked)
+tests/fixtures/tiny_qwen/*.safetensors
+tests/fixtures/tiny_qwen/tokenizer.json
+tests/fixtures/tiny_qwen/tokenizer_config.json
+tests/fixtures/tiny_qwen/special_tokens_map.json
+tests/fixtures/tiny_qwen_2l/*.safetensors
+tests/fixtures/tiny_qwen_2l/tokenizer.json
+tests/fixtures/tiny_qwen_2l/tokenizer_config.json
+tests/fixtures/tiny_qwen_2l/special_tokens_map.json

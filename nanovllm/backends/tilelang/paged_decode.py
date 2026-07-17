@@ -429,10 +429,14 @@ def run_tilelang_attention_decode_paged(
         num_stages,
         threads,
         in_dtype,
-        backend == "cpu",
+        backend != "cuda",
     )
     kernel = _compile_attention_kernel(
-        build_flash_attention_decode_paged_kernel, build_args, 5, backend
+        build_flash_attention_decode_paged_kernel,
+        build_args,
+        5,
+        backend,
+        kernel_name="decode_paged",
     )
     return kernel(
         q.contiguous(),

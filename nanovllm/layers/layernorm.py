@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 
+from nanovllm.backends.tilelang.runtime import get_tilelang_execution_backend
+
 
 # Set from ModelRunner via ``set_norm_backend(config.norm_backend)``.
 _NORM_BACKEND = "torch"
@@ -64,7 +66,7 @@ class RMSNorm(nn.Module):
         if _NORM_BACKEND == "tilelang":
             from nanovllm.backends.tilelang.rmsnorm import run_tilelang_rmsnorm
             return run_tilelang_rmsnorm(
-                x, self.weight, residual, eps=self.eps, backend="cuda"
+                x, self.weight, residual, eps=self.eps, backend=get_tilelang_execution_backend()
             )
         if residual is None:
             return self.rms_forward(x)

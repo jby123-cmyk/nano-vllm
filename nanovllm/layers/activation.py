@@ -2,6 +2,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from nanovllm.backends.tilelang.runtime import get_tilelang_execution_backend
+
 
 _ACT_BACKEND = "torch"
 
@@ -29,5 +31,5 @@ class SiluAndMul(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if _ACT_BACKEND == "tilelang":
             from nanovllm.backends.tilelang.activation import run_tilelang_silu_mul
-            return run_tilelang_silu_mul(x, backend="cuda")
+            return run_tilelang_silu_mul(x, backend=get_tilelang_execution_backend())
         return self._torch_forward(x)

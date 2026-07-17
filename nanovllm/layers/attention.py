@@ -1,15 +1,14 @@
 import torch
 from torch import nn
-import triton
-import triton.language as tl
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+from nanovllm.backends.tilelang.runtime import get_tilelang_execution_backend
 
 
 # Set from ModelRunner via ``set_attn_backend(config.attn_backend)``.
 # Default preserves existing flash_attn behavior.
 _ATTN_BACKEND = "flash_attn"
+_STORE_KVCACHE_KERNEL = None
 
 
 def set_attn_backend(backend: str) -> None:
@@ -26,27 +25,40 @@ def get_attn_backend() -> str:
     return _ATTN_BACKEND
 
 
-@triton.jit
-def store_kvcache_kernel(
-    key_ptr,
-    key_stride,
-    value_ptr,
-    value_stride,
-    k_cache_ptr,
-    v_cache_ptr,
-    slot_mapping_ptr,
-    D: tl.constexpr,
-):
-    idx = tl.program_id(0)
-    slot = tl.load(slot_mapping_ptr + idx)
-    if slot == -1: return
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
+def _get_store_kvcache_kernel():
+    """Lazily JIT-compile the Triton KV-store kernel (CUDA path only)."""
+    global _STORE_KVCACHE_KERNEL
+    if _STORE_KVCACHE_KERNEL is not None:
+        return _STORE_KVCACHE_KERNEL
+
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def store_kvcache_kernel(
+        key_ptr,
+        key_stride,
+        value_ptr,
+        value_stride,
+        k_cache_ptr,
+        v_cache_ptr,
+        slot_mapping_ptr,
+        D: tl.constexpr,
+    ):
+        idx = tl.program_id(0)
+        slot = tl.load(slot_mapping_ptr + idx)
+        if slot == -1:
+            return
+        key_offsets = idx * key_stride + tl.arange(0, D)
+        value_offsets = idx * value_stride + tl.arange(0, D)
+        key = tl.load(key_ptr + key_offsets)
+        value = tl.load(value_ptr + value_offsets)
+        cache_offsets = slot * D + tl.arange(0, D)
+        tl.store(k_cache_ptr + cache_offsets, key)
+        tl.store(v_cache_ptr + cache_offsets, value)
+
+    _STORE_KVCACHE_KERNEL = store_kvcache_kernel
+    return _STORE_KVCACHE_KERNEL
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
@@ -59,9 +71,11 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     if _ATTN_BACKEND == "tilelang":
         from nanovllm.backends.tilelang.kv_store import run_tilelang_store_kvcache
         run_tilelang_store_kvcache(
-            key, value, k_cache, v_cache, slot_mapping, backend="cuda"
+            key, value, k_cache, v_cache, slot_mapping,
+            backend=get_tilelang_execution_backend(),
         )
         return
+    store_kvcache_kernel = _get_store_kvcache_kernel()
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
@@ -101,9 +115,11 @@ class Attention(nn.Module):
                     softmax_scale=self.scale,
                     causal=True,
                     block_table=context.block_tables,
-                    backend="cuda",
+                    backend=get_tilelang_execution_backend(),
                 )
             else:
+                from flash_attn import flash_attn_varlen_func
+
                 if context.block_tables is not None:    # prefix cache
                     k, v = k_cache, v_cache
                 o = flash_attn_varlen_func(q, k, v,
@@ -112,7 +128,6 @@ class Attention(nn.Module):
                                            softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
             if _ATTN_BACKEND == "tilelang":
-                # Lazy import so non-tilelang runs never pull TileLang.
                 from nanovllm.backends.tilelang.paged_decode import (
                     run_tilelang_flash_attn_with_kvcache,
                 )
@@ -124,12 +139,14 @@ class Attention(nn.Module):
                     block_table=context.block_tables,
                     softmax_scale=self.scale,
                     causal=True,
-                    backend="cuda",
+                    backend=get_tilelang_execution_backend(),
                     block_N=min(128, k_cache.size(1)),
                     block_H=max(1, self.num_heads // self.num_kv_heads),
                 )
             else:
+                from flash_attn import flash_attn_with_kvcache
+
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                            cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables,
                                             softmax_scale=self.scale, causal=True)
         return o

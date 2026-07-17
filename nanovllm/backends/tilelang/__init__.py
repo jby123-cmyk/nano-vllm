@@ -42,6 +42,12 @@ from nanovllm.backends.tilelang.embedding import (
     dump_tensorir,
     run_tilelang_embedding,
 )
+from nanovllm.backends.tilelang.runtime import (
+    RvvExecutionUnavailableError,
+    configure_tilelang_runtime,
+    get_tilelang_execution_backend,
+    get_tilelang_runtime,
+)
 from nanovllm.backends.tilelang.weights import (
     load_attention_dims,
     load_embedding_weight,
@@ -49,6 +55,10 @@ from nanovllm.backends.tilelang.weights import (
 )
 
 __all__ = [
+    "RvvExecutionUnavailableError",
+    "configure_tilelang_runtime",
+    "get_tilelang_execution_backend",
+    "get_tilelang_runtime",
     "build_embedding_kernel",
     "dump_tensorir",
     "run_tilelang_embedding",

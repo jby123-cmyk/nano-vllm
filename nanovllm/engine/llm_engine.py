@@ -10,6 +10,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.backends.spike.report_context import active_collector, begin_generate_run, install_collector
 
 
 class LLMEngine:
@@ -35,14 +36,24 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        if not getattr(self, "model_runner", None):
+            return
+        try:
+            atexit.unregister(self.exit)
+        except Exception:
+            pass
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
+        install_collector(None)
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        collector = active_collector()
+        if collector is not None:
+            collector.set_prompt_tokens_if_empty(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
@@ -63,6 +74,10 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        collector = active_collector()
+        if collector is not None:
+            begin_generate_run()
+            collector.begin_generate()
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
@@ -87,4 +102,8 @@ class LLMEngine:
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        if collector is not None:
+            if outputs:
+                collector.set_output_tokens(outputs[0]["token_ids"])
+            collector.finalize()
         return outputs

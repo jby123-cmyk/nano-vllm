@@ -84,19 +84,17 @@ def build_rmsnorm_kernel(
     return main
 
 
+from nanovllm.backends.tilelang.runtime import compile_tilelang_kernel
+
+
 def _compile_rmsnorm_kernel(build_args: tuple, backend: str):
-    if backend == "cuda":
-        return build_rmsnorm_kernel(*build_args)
-    if backend == "cpu":
-        with tvm.target.Target("llvm"):
-            return tilelang.compile(
-                build_rmsnorm_kernel.get_tir(*build_args),
-                out_idx=[3, 4],
-                target="llvm",
-                target_host="llvm",
-                execution_backend="tvm_ffi",
-            )
-    raise ValueError(f"backend must be 'cuda' or 'cpu', got {backend!r}.")
+    return compile_tilelang_kernel(
+        build_rmsnorm_kernel,
+        build_args,
+        [3, 4],
+        backend,
+        kernel_name="rmsnorm",
+    )
 
 
 def run_tilelang_rmsnorm(

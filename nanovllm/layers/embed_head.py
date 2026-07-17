@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from nanovllm.backends.tilelang.runtime import get_tilelang_execution_backend
 from nanovllm.utils.context import get_context
 
 
@@ -53,7 +54,7 @@ class VocabParallelEmbedding(nn.Module):
             x = mask * (x - self.vocab_start_idx)
         if _EMBED_BACKEND == "tilelang":
             from nanovllm.backends.tilelang.embedding import run_tilelang_embedding
-            y = run_tilelang_embedding(x.view(-1), self.weight, backend="cuda")
+            y = run_tilelang_embedding(x.view(-1), self.weight, backend=get_tilelang_execution_backend())
         else:
             y = F.embedding(x, self.weight)
         if self.tp_size > 1:
@@ -82,7 +83,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             x = x[last_indices].contiguous()
         if get_linear_backend() == "tilelang":
             from nanovllm.backends.tilelang.linear import run_tilelang_linear
-            logits = run_tilelang_linear(x, self.weight, None, backend="cuda")
+            logits = run_tilelang_linear(x, self.weight, None, backend=get_tilelang_execution_backend())
         else:
             logits = F.linear(x, self.weight)
         if self.tp_size > 1:

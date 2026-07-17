@@ -78,19 +78,17 @@ def build_rope_kernel(
     return main
 
 
+from nanovllm.backends.tilelang.runtime import compile_tilelang_kernel
+
+
 def _compile_rope_kernel(build_args: tuple, backend: str):
-    if backend == "cuda":
-        return build_rope_kernel(*build_args)
-    if backend == "cpu":
-        with tvm.target.Target("llvm"):
-            return tilelang.compile(
-                build_rope_kernel.get_tir(*build_args),
-                out_idx=[4, 5],
-                target="llvm",
-                target_host="llvm",
-                execution_backend="tvm_ffi",
-            )
-    raise ValueError(f"backend must be 'cuda' or 'cpu', got {backend!r}.")
+    return compile_tilelang_kernel(
+        build_rope_kernel,
+        build_args,
+        [4, 5],
+        backend,
+        kernel_name="rope",
+    )
 
 
 def run_tilelang_rope(

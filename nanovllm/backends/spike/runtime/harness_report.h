@@ -12,4 +12,15 @@ HarnessCompareStats harness_compare_float(const float *out, const float *golden,
 // Print HARNESS_SUMMARY line (Spike forwards via HTIF) and return process exit code.
 int harness_finish(const char *app, int kernel_status, HarnessCompareStats stats, int count, float atol);
 
+typedef struct HarnessOutputSpec {
+  const char *name;
+  const char *dtype_tag;
+  const unsigned char *data;
+  int nbytes;
+} HarnessOutputSpec;
+
+// Execute mode: dump output tensor bytes over HTIF and return process exit code.
+int harness_finish_execute(
+    const char *app, int kernel_status, const HarnessOutputSpec *outputs, int num_outputs);
+
 #endif

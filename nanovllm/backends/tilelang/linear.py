@@ -119,20 +119,18 @@ def build_linear_kernel(
     return main
 
 
+from nanovllm.backends.tilelang.runtime import compile_tilelang_kernel
+
+
 def _compile_linear_kernel(build_args: tuple, out_idx: int, backend: str):
     """Compile ``build_linear_kernel`` for ``backend`` and return a callable."""
-    if backend == "cuda":
-        return build_linear_kernel(*build_args)
-    if backend == "cpu":
-        with tvm.target.Target("llvm"):
-            return tilelang.compile(
-                build_linear_kernel.get_tir(*build_args),
-                out_idx=[out_idx],
-                target="llvm",
-                target_host="llvm",
-                execution_backend="tvm_ffi",
-            )
-    raise ValueError(f"backend must be 'cuda' or 'cpu', got {backend!r}.")
+    return compile_tilelang_kernel(
+        build_linear_kernel,
+        build_args,
+        out_idx,
+        backend,
+        kernel_name="linear",
+    )
 
 
 def run_tilelang_linear(
