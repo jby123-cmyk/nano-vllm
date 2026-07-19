@@ -198,7 +198,7 @@ class ModelRunner:
             current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
             config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(
+        self.kv_cache = torch.zeros(
             2,
             hf_config.num_hidden_layers,
             config.num_kvcache_blocks,
@@ -333,6 +333,10 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
+        # TileLang host-llvm outputs may alias a reusable pool. Materialize before
+        # sampling/reporting so later kernels cannot observe a live view (1L bulk
+        # prefill + report was producing NaN decode logits when the view lingered).
+        logits = logits.detach().to(dtype=torch.float32, copy=True)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         if collector is not None and step_started_at is not None:
             sampled = token_ids[0] if token_ids else None

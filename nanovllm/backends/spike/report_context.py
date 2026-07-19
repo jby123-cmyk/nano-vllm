@@ -25,6 +25,11 @@ _CONTEXT = ReportContext()
 def install_collector(collector: GenerateReportCollector | None) -> None:
     global _COLLECTOR
     _COLLECTOR = collector
+    if collector is None:
+        _CONTEXT.phase = "init"
+        _CONTEXT.step_id = -1
+        _CONTEXT.in_warmup = False
+        _CONTEXT.in_generate = False
 
 
 def active_collector() -> GenerateReportCollector | None:

@@ -315,10 +315,8 @@ def _maybe_wrap_cpu_reporting(
     build_args: tuple,
     build_args_digest: str,
 ) -> Callable:
-    from nanovllm.backends.spike.report_context import active_collector
-
-    if active_collector() is None:
-        return callable_
+    # Always wrap; the wrapper no-ops when no collector is installed so compile
+    # order does not depend on whether reporting was enabled at JIT time.
     return _ReportingCpuCallable(
         callable_,
         kernel_name=kernel_name,

@@ -113,9 +113,5 @@ def run_tilelang_store_kvcache(
     )
     if get_tilelang_execution_backend() == "rvv" and isinstance(result, tuple):
         k_out, v_out = result
-        sm = slot_mapping.to(torch.int32)
-        for i in range(num_tokens):
-            slot = int(sm[i].item())
-            if slot >= 0:
-                k_flat[slot].copy_(k_out[slot].to(device=k_flat.device, dtype=k_flat.dtype))
-                v_flat[slot].copy_(v_out[slot].to(device=v_flat.device, dtype=v_flat.dtype))
+        k_flat.copy_(k_out.to(device=k_flat.device, dtype=k_flat.dtype))
+        v_flat.copy_(v_out.to(device=v_flat.device, dtype=v_flat.dtype))
